@@ -1,5 +1,7 @@
 # Parity
 
+[![Go Report Card](https://goreportcard.com/badge/github.com/TFMV/parity)](https://goreportcard.com/report/github.com/TFMV/parity)
+
 **Parity** is a high-performance data validation engine that ensures data consistency across heterogeneous systems. Built on **Apache Arrow** and **Go**, Parity delivers exceptional performance through vectorized operations and parallel processing. By leveraging ADBC (Arrow Database Connectivity), it enables seamless validation across modern data platforms with minimal overhead.
 
 ---
