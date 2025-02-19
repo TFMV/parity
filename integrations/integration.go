@@ -59,3 +59,13 @@ func (p *DatabasePair) Source1() Database {
 func (p *DatabasePair) Source2() Database {
 	return p.db2
 }
+
+func (p *DatabasePair) Close() {
+	p.db1.Close()
+	p.db2.Close()
+}
+
+// ConnCount returns the total number of open connections in both databases
+func (p *DatabasePair) ConnCount() int {
+	return p.db1.ConnCount() + p.db2.ConnCount()
+}
