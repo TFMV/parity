@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"time"
 
-	version "github.com/TFMV/parity"
+	"github.com/TFMV/parity/version"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"

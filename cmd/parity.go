@@ -8,8 +8,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	version "github.com/TFMV/parity"
 	"github.com/TFMV/parity/api"
+	"github.com/TFMV/parity/version"
 	"github.com/docopt/docopt-go"
 )
 
