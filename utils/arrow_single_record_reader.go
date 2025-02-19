@@ -1,12 +1,7 @@
 package utils
 
 import (
-	"log"
-	"strconv"
-
 	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 // SingleRecordReader is a custom RecordReader that wraps a single arrow.Record.
@@ -57,36 +52,4 @@ func (r *SingleRecordReader) Retain() {
 // Close releases resources associated with the SingleRecordReader.
 func (r *SingleRecordReader) Close() error {
 	return nil
-}
-
-func ConvertNumericFields(record arrow.Record) arrow.Record {
-	for i := 0; i < int(record.NumCols()); i++ {
-		col := record.Column(i)
-		switch record.ColumnName(i) {
-		case "dep_time", "arr_time":
-			strArray, ok := col.(*array.String)
-			if !ok {
-				continue
-			}
-
-			floatBuilder := array.NewFloat64Builder(memory.DefaultAllocator)
-			for j := 0; j < int(strArray.Len()); j++ {
-				if strArray.IsNull(j) {
-					floatBuilder.AppendNull()
-				} else {
-					val, err := strconv.ParseFloat(strArray.Value(j), 64)
-					if err != nil {
-						log.Printf("Warning: failed to convert %s to float64: %v", strArray.Value(j), err)
-						floatBuilder.AppendNull()
-					} else {
-						floatBuilder.Append(val)
-					}
-				}
-			}
-
-			newColumn := floatBuilder.NewArray()
-			record.SetColumn(i, newColumn)
-		}
-	}
-	return record
 }
