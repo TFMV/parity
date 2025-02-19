@@ -1,7 +1,7 @@
+// duckdb.go
 // This module implements the DuckDB driver for the Arrow ADBC interface.
 // It is a wrapper around the DuckDB C API, providing a Go interface.
-
-package integrations
+package duckdb
 
 import (
 	"context"
@@ -14,6 +14,8 @@ import (
 	"github.com/apache/arrow-adbc/go/adbc/drivermgr"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+
+	integrations "github.com/TFMV/parity/integrations"
 )
 
 // Options define the configuration for opening a DuckDB database.
@@ -28,7 +30,7 @@ type Options struct {
 	Context context.Context
 }
 
-// Option is a functional config approach
+// Option is a functional config approach.
 type Option func(*Options)
 
 // WithPath sets a file path for the DuckDB DB.
@@ -39,7 +41,6 @@ func WithPath(p string) Option {
 }
 
 // WithDriverPath sets the path to the DuckDB driver library.
-// If not provided, the driver will be auto-detected based on the current OS.
 func WithDriverPath(p string) Option {
 	return func(o *Options) {
 		o.DriverPath = p
@@ -54,7 +55,6 @@ func WithContext(ctx context.Context) Option {
 }
 
 // DuckDB is the primary struct managing a DuckDB database via ADBC.
-// Use NewDuckDB(...) to construct.
 type DuckDB struct {
 	mu     sync.Mutex
 	db     adbc.Database
@@ -64,19 +64,14 @@ type DuckDB struct {
 	conns []*duckConn // track open connections
 }
 
-// duckConn is a simple wrapper holding an open connection.
+// duckConn is a wrapper holding an open connection.
 type duckConn struct {
 	parent *DuckDB
 	adbc.Connection
 }
 
 // NewDuckDB opens or creates a DuckDB instance (file-based or in-memory).
-// The driver library is auto-detected if not provided. Example usage:
-//
-//	duck, err := NewDuckDB(bigquack.WithPath("/tmp/duck.db"))
-//	if err != nil { ... }
 func NewDuckDB(options ...Option) (*DuckDB, error) {
-	// gather defaults
 	var opts Options
 	for _, opt := range options {
 		opt(&opts)
@@ -85,7 +80,7 @@ func NewDuckDB(options ...Option) (*DuckDB, error) {
 		opts.Context = context.Background()
 	}
 
-	// auto-detect driver if empty
+	// Auto-detect driver if empty.
 	dPath := opts.DriverPath
 	if dPath == "" {
 		switch runtime.GOOS {
@@ -114,18 +109,15 @@ func NewDuckDB(options ...Option) (*DuckDB, error) {
 		return nil, fmt.Errorf("error creating new DuckDB database: %w", err)
 	}
 
-	duck := &DuckDB{
+	return &DuckDB{
 		db:     db,
 		driver: driver,
 		opts:   opts,
-	}
-	return duck, nil
+	}, nil
 }
 
-// OpenConnection opens a new connection to DuckDB. The returned connection
-// should be closed by calling its Close method, or you can rely on DuckDB.Close()
-// to automatically close all open connections.
-func (d *DuckDB) OpenConnection() (*duckConn, error) {
+// OpenConnection creates a new connection to DuckDB.
+func (d *DuckDB) OpenConnection() (integrations.Connection, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -138,19 +130,15 @@ func (d *DuckDB) OpenConnection() (*duckConn, error) {
 	return dc, nil
 }
 
-// Close closes the DuckDB database and all open connections. It is recommended
-// to call this when finished to ensure all WAL data is flushed if file-based.
+// Close closes the DuckDB database and all open connections.
 func (d *DuckDB) Close() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// close all open conns
 	for _, c := range d.conns {
-		c.Connection.Close()
+		c.Close()
 	}
 	d.conns = nil
-
-	// close db
 	d.db.Close()
 	d.db = nil
 }
@@ -163,13 +151,13 @@ func (d *DuckDB) ConnCount() int {
 }
 
 // Path returns the database file path, or empty if in-memory.
-// Note: For PostgreSQL equivalent, see URI() which returns the connection string.
 func (d *DuckDB) Path() string {
 	return d.opts.Path
 }
 
-// Exec runs a statement that doesn't produce a result set, returning
-// the number of rows affected if known, else -1.
+// --- duckConn methods to implement the Connection interface ---
+
+// Exec executes a statement that doesn't produce a result set.
 func (c *duckConn) Exec(ctx context.Context, sql string) (int64, error) {
 	stmt, err := c.NewStatement()
 	if err != nil {
@@ -184,34 +172,31 @@ func (c *duckConn) Exec(ctx context.Context, sql string) (int64, error) {
 	return affected, err
 }
 
-// Query runs a SQL query returning (RecordReader, adbc.Statement, rowCount).
-// rowCount will be -1 if not known. Caller is responsible for closing the
-// returned statement and the RecordReader.
-func (c *duckConn) Query(ctx context.Context, sql string) (array.RecordReader, adbc.Statement, int64, error) {
+// Query executes a SQL query and returns a RecordReader.
+func (c *duckConn) Query(ctx context.Context, sql string) (array.RecordReader, error) {
 	stmt, err := c.NewStatement()
 	if err != nil {
-		return nil, nil, -1, fmt.Errorf("failed to create statement: %w", err)
+		return nil, fmt.Errorf("failed to create statement: %w", err)
 	}
 	if err := stmt.SetSqlQuery(sql); err != nil {
 		stmt.Close()
-		return nil, nil, -1, fmt.Errorf("failed to set SQL query: %w", err)
+		return nil, fmt.Errorf("failed to set SQL query: %w", err)
 	}
 
-	rr, rowsAffected, err := stmt.ExecuteQuery(ctx)
+	rr, _, err := stmt.ExecuteQuery(ctx)
 	if err != nil {
 		stmt.Close()
-		return nil, nil, -1, err
+		return nil, err
 	}
-	return rr, stmt, rowsAffected, nil
+	return newWrappedRecordReader(rr, stmt), nil
 }
 
-// GetTableSchema fetches the Arrow schema of a table in the given catalog/schema
-// (pass nil for defaults).
-func (c *duckConn) GetTableSchema(ctx context.Context, catalog, dbSchema *string, tableName string) (*arrow.Schema, error) {
-	return c.Connection.GetTableSchema(ctx, catalog, dbSchema, tableName)
+// GetTableSchema returns the Arrow schema of a table.
+func (c *duckConn) GetTableSchema(ctx context.Context, catalog, schema *string, table string) (*arrow.Schema, error) {
+	return c.Connection.GetTableSchema(ctx, catalog, schema, table)
 }
 
-// Close closes the connection, removing it from the parent DuckDB's tracking.
+// Close closes the connection, removing it from the parent's tracking.
 func (c *duckConn) Close() {
 	c.parent.mu.Lock()
 	defer c.parent.mu.Unlock()
@@ -226,3 +211,53 @@ func (c *duckConn) Close() {
 	c.Connection.Close()
 	c.parent = nil
 }
+
+// --- recordReaderWrapper wraps a RecordReader and its Statement ---
+
+type recordReaderWrapper struct {
+	rr   array.RecordReader
+	stmt adbc.Statement
+}
+
+func (w *recordReaderWrapper) Schema() *arrow.Schema {
+	return w.rr.Schema()
+}
+
+func (w *recordReaderWrapper) Next() bool {
+	return w.rr.Next()
+}
+
+func (w *recordReaderWrapper) Record() arrow.Record {
+	return w.rr.Record()
+}
+
+func (w *recordReaderWrapper) Err() error {
+	return w.rr.Err()
+}
+
+func (w *recordReaderWrapper) Release() {
+	w.rr.Release()
+}
+
+func (w *recordReaderWrapper) Retain() {
+	w.rr.Retain()
+}
+
+func (w *recordReaderWrapper) Close() error {
+	err := w.stmt.Close()
+	w.rr.Release()
+	return err
+}
+
+func newWrappedRecordReader(rr array.RecordReader, stmt adbc.Statement) array.RecordReader {
+	return &recordReaderWrapper{
+		rr:   rr,
+		stmt: stmt,
+	}
+}
+
+// Ensure DuckDB implements Database.
+var _ integrations.Database = (*DuckDB)(nil)
+
+// Ensure duckConn implements Connection.
+var _ integrations.Connection = (*duckConn)(nil)
