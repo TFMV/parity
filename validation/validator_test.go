@@ -161,6 +161,51 @@ func TestValidatorCompare_Failure_RecordCountMismatch(t *testing.T) {
 	}
 }
 
+func BenchmarkValidatorCompare(b *testing.B) {
+	ctx := context.Background()
+
+	// Create test databases
+	db1, err := duckdb.NewDuckDB(duckdb.WithPath(""))
+	if err != nil {
+		b.Fatalf("failed to create DuckDB: %v", err)
+	}
+	db2, err := duckdb.NewDuckDB(duckdb.WithPath(""))
+	if err != nil {
+		b.Fatalf("failed to create DuckDB: %v", err)
+	}
+	defer func() {
+		db1.Close()
+		db2.Close()
+	}()
+
+	// Setup test data
+	for _, db := range []*duckdb.DuckDB{db1, db2} {
+		conn, err := db.OpenConnection()
+		if err != nil {
+			b.Fatalf("failed to open connection: %v", err)
+		}
+		for _, q := range []string{
+			"CREATE TABLE test (id INTEGER)",
+			"INSERT INTO test VALUES (1), (2)",
+		} {
+			if _, err := conn.Exec(ctx, q); err != nil {
+				b.Fatalf("failed to execute query %q: %v", q, err)
+			}
+		}
+		conn.Close()
+	}
+
+	integrationPair := integrations.NewDatabasePair(db1, db2)
+	validator := NewValidator(integrationPair)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := validator.Compare(ctx, "SELECT * FROM test", "SELECT * FROM test"); err != nil {
+			b.Fatalf("expected no error but got: %v", err)
+		}
+	}
+}
+
 // Cleanup any temporary files if necessary.
 func TestMain(m *testing.M) {
 	code := m.Run()
