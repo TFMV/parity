@@ -19,6 +19,9 @@ import (
 // Ensure Postgres implements Database.
 var _ integrations.Database = (*Postgres)(nil)
 
+// Ensure pgConn implements Connection.
+var _ integrations.Connection = (*pgConn)(nil)
+
 // Postgres is the primary struct managing a PostgreSQL database via ADBC.
 type Postgres struct {
 	mu     sync.Mutex
@@ -70,11 +73,16 @@ func NewPostgres(options ...integrations.Option) (*Postgres, error) {
 		return nil, fmt.Errorf("error creating new PostgreSQL database: %w", err)
 	}
 
-	return &Postgres{
+	pg := &Postgres{
 		db:     db,
 		driver: driver,
 		opts:   opts,
-	}, nil
+	}
+
+	cleanupPg := pg
+	runtime.AddCleanup(pg, func(db *Postgres) { db.Close() }, cleanupPg)
+
+	return pg, nil
 }
 
 // OpenConnection creates a new connection to Postgres.
@@ -87,7 +95,11 @@ func (p *Postgres) OpenConnection() (integrations.Connection, error) {
 		return nil, fmt.Errorf("failed to open connection: %w", err)
 	}
 	pc := &pgConn{parent: p, Connection: conn}
+	cleanupConn := pc
 	p.conns = append(p.conns, pc)
+
+	runtime.AddCleanup(pc, func(conn *pgConn) { conn.Close() }, cleanupConn)
+
 	return pc, nil
 }
 
@@ -215,6 +227,3 @@ func newWrappedRecordReader(rr array.RecordReader, stmt adbc.Statement) array.Re
 		stmt: stmt,
 	}
 }
-
-// Ensure pgConn implements Connection.
-var _ integrations.Connection = (*pgConn)(nil)
