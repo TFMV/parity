@@ -4,6 +4,7 @@ package logger
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"go.uber.org/zap"
@@ -13,8 +14,33 @@ import (
 var (
 	log     *zap.Logger
 	once    sync.Once
-	logPath = "parity.log" // default path
+	logPath = "parity.log" // default relative path
 )
+
+// findProjectRoot looks for the project root by searching for .git or go.mod
+func findProjectRoot() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+
+	for {
+		// Check for common project root indicators
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir, nil
+		}
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+
+		// Move up one directory
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("could not find project root")
+		}
+		dir = parent
+	}
+}
 
 // SetLogPath allows changing the log file location before initialization
 func SetLogPath(path string) {
@@ -24,12 +50,32 @@ func SetLogPath(path string) {
 // InitLogger initializes the Zap logger with structured logging.
 func InitLogger() {
 	once.Do(func() {
+		var finalPath string
+
+		// If path is absolute, use it directly
+		if filepath.IsAbs(logPath) {
+			finalPath = logPath
+		} else {
+			// Find project root for relative paths
+			root, err := findProjectRoot()
+			if err != nil {
+				panic(fmt.Sprintf("Failed to find project root: %v", err))
+			}
+			finalPath = filepath.Join(root, logPath)
+		}
+
+		// Create log directory if it doesn't exist
+		logDir := filepath.Dir(finalPath)
+		if err := os.MkdirAll(logDir, 0755); err != nil {
+			panic(fmt.Sprintf("Failed to create log directory: %v", err))
+		}
+
 		// Define log level (adjustable)
 		level := zap.NewAtomicLevelAt(zap.InfoLevel)
 
 		// Configure file logging
 		fileEncoder := zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig())
-		file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		file, err := os.OpenFile(finalPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 		if err != nil {
 			panic(fmt.Sprintf("Failed to open log file: %v", err))
 		}
