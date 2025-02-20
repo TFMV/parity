@@ -18,6 +18,12 @@ import (
 	integrations "github.com/TFMV/parity/integrations"
 )
 
+// Ensure DuckDB implements Database.
+var _ integrations.Database = (*DuckDB)(nil)
+
+// Ensure duckConn implements Connection.
+var _ integrations.Connection = (*duckConn)(nil)
+
 // Options define the configuration for opening a DuckDB database.
 type Options struct {
 	// Path to the DuckDB file ("" => in-memory)
@@ -109,11 +115,18 @@ func NewDuckDB(options ...Option) (*DuckDB, error) {
 		return nil, fmt.Errorf("error creating new DuckDB database: %w", err)
 	}
 
-	return &DuckDB{
+	duck := &DuckDB{
 		db:     db,
 		driver: driver,
 		opts:   opts,
-	}, nil
+	}
+
+	// Create a new struct for cleanup
+	cleanupDuck := new(DuckDB)
+	*cleanupDuck = *duck
+	runtime.AddCleanup(duck, func(db *DuckDB) { db.Close() }, cleanupDuck)
+
+	return duck, nil
 }
 
 // OpenConnection creates a new connection to DuckDB.
@@ -127,6 +140,12 @@ func (d *DuckDB) OpenConnection() (integrations.Connection, error) {
 	}
 	dc := &duckConn{parent: d, Connection: conn}
 	d.conns = append(d.conns, dc)
+
+	// Create a new struct for cleanup
+	cleanupConn := new(duckConn)
+	*cleanupConn = *dc
+	runtime.AddCleanup(dc, func(conn *duckConn) { conn.Close() }, cleanupConn)
+
 	return dc, nil
 }
 
@@ -255,9 +274,3 @@ func newWrappedRecordReader(rr array.RecordReader, stmt adbc.Statement) array.Re
 		stmt: stmt,
 	}
 }
-
-// Ensure DuckDB implements Database.
-var _ integrations.Database = (*DuckDB)(nil)
-
-// Ensure duckConn implements Connection.
-var _ integrations.Connection = (*duckConn)(nil)
