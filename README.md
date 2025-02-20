@@ -2,27 +2,32 @@
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/TFMV/parity)](https://goreportcard.com/report/github.com/TFMV/parity)
 
-Parity is a high-performance data validation framework designed to ensure data consistency across different databases. It leverages Apache Arrow for in-memory data processing and supports PostgreSQL, DuckDB, and other databases.
+Parity is a Go-based, high-performance data validation framework that ensures data consistency across different databases. It leverages Apache Arrow for in-memory processing, parallelized execution, and structured reporting.
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
-| Schema Validation | Compare column structures between databases. |
-| Row Count Validation | Ensure record counts match between source and destination. |
-| Aggregate Validation | Compare SUM, AVG, MIN, MAX, and COUNT values. |
-| Value-Level Validation | Perform full or sampled row comparisons. |
-| Partition & Shard Validation | Validate partitioned and sharded datasets. |
-| Parallelized Execution | Runs validations concurrently for maximum efficiency. |
-| Structured Logging | Uses Zap for high-performance logging. |
-| Extensible Reporting | Generates JSON and HTML validation reports. |
+| Schema | Compare column structures between databases |
+| Row Count | Ensure record counts match between sources |
+| Aggregates | Compare SUM, AVG, MIN, MAX, COUNT values |
+| Value-Level | Perform full or sampled row comparisons |
+| Partitioning | Validate partitioned and sharded datasets |
+| Parallel | Runs validations concurrently for efficiency |
+| Logging | Uses Zap for high-performance logging |
+| Reports | Generates JSON and HTML validation reports |
 
 ## Installation
 
 ```sh
 git clone https://github.com/TFMV/parity.git
 cd parity
+
+# Install dependencies
 go mod tidy
+
+# Run tests to verify setup
+go test ./...
 ```
 
 ## Usage
@@ -48,9 +53,9 @@ func main() {
 
     // Define validation thresholds
     thresholds := metrics.ValidationThresholds{
-        NumericDifferenceTolerance: 0.01,
-        RowCountTolerance: 5,
-        SamplingConfidenceLevel: 95.0,
+        NumericDifferenceTolerance: 0.01,  // Allows small floating-point differences
+        RowCountTolerance:         5,     // Allows small differences in row counts
+        SamplingConfidenceLevel:   95.0, // 95% confidence level for sampling
     }
 
     // Create validator
@@ -67,11 +72,14 @@ func main() {
 }
 ```
 
-## Supported Databases
+## 🛠 Supported Databases
 
-- PostgreSQL
-- DuckDB
-- (Planned: BigQuery, Snowflake, MySQL, MongoDB)
+| Database Type | Supported Engines |
+|--------------|------------------|
+| Relational | PostgreSQL, DuckDB (Production-Ready) |
+| Cloud Data Warehouses | Snowflake, BigQuery (Planned) |
+| OLTP Databases | MySQL, MariaDB (Planned) |
+| Document Stores | MongoDB, JSON Schema (Future) |
 
 ## Validation Types
 
@@ -86,8 +94,11 @@ func main() {
 
 ## Reports & Logging
 
-- Generates structured JSON and HTML reports.
-- Logs all validation events using Zap.
+Parity automatically generates structured reports to help diagnose data inconsistencies:
+
+- JSON Reports – Machine-readable, structured output.
+- HTML Reports – Human-friendly, visually formatted validation results.
+- Logs & Alerts – Uses Zap to log mismatches and validation summaries.
 
 ## Example Report
 
