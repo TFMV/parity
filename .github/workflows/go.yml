@@ -1,0 +1,41 @@
+# GitHub Actions workflow for building and testing a Go project
+
+name: Go CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.24'
+        cache: true  # Enable dependency caching
+
+    - name: Verify Dependencies
+      run: go mod tidy && git diff --exit-code go.mod go.sum
+      # Ensures go.mod/go.sum are up-to-date. Fails if changes are detected.
+
+    - name: Build
+      run: go build -v ./...
+    
+    - name: Run Tests with Race Detector & Coverage
+      run: go test -race -coverprofile=coverage.out -covermode=atomic -v ./...
+
+    - name: Upload Coverage Report
+      uses: codecov/codecov-action@v4
+      with:
+        file: ./coverage.out
+        fail_ci_if_error: true  # Fails CI if coverage upload fails
