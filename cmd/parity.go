@@ -1,4 +1,3 @@
-// Package main is the entry point for the Parity CLI.
 package main
 
 import (
@@ -6,98 +5,121 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
+	"time"
 
 	"github.com/TFMV/parity/api"
+	"github.com/TFMV/parity/logger"
 	"github.com/TFMV/parity/version"
-	"github.com/docopt/docopt-go"
+	"github.com/briandowns/spinner"
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
 
-var osExit = os.Exit // Allow overriding for tests
-
 func main() {
-	if err := runCLI(); err != nil {
+	rootCmd := &cobra.Command{
+		Use:   "parity",
+		Short: "Parity CLI for data validation",
+	}
+
+	// Version command
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "version",
+		Short: "Show the version of Parity",
+		Run: func(cmd *cobra.Command, args []string) {
+			cmd.Printf("Parity %s\n", version.Version)
+		},
+	})
+
+	// Start command
+	startCmd := &cobra.Command{
+		Use:   "start",
+		Short: "Start the Parity API server",
+		RunE:  startServer,
+	}
+	rootCmd.AddCommand(startCmd)
+
+	// Validate Config command
+	validateConfigCmd := &cobra.Command{
+		Use:   "validate-config",
+		Short: "Validate the Parity configuration file",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return validateConfig()
+		},
+	}
+	rootCmd.AddCommand(validateConfigCmd)
+
+	// Run Validation command
+	runCmd := &cobra.Command{
+		Use:   "run",
+		Short: "Run a data validation",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runValidation()
+		},
+	}
+	rootCmd.AddCommand(runCmd)
+
+	if err := rootCmd.Execute(); err != nil {
 		log.Fatalf("Error: %v", err)
 	}
 }
 
-func runCLI() error {
-	usage := `
-	Usage:
-		parity [options]
-
-	Options:
-		-h, --help     Show this help message
-		-v, --version  Show the version
-		--start        Start the parity server
-	`
-
-	// Handle version flag directly first
-	for _, arg := range os.Args[1:] {
-		if arg == "--version" || arg == "-v" {
-			fmt.Println("Parity", version.Version)
-			osExit(0)
-			return nil
-		}
-	}
-
-	parser := &docopt.Parser{
-		HelpHandler:  func(err error, usage string) {},
-		OptionsFirst: true,
-	}
-
-	arguments, err := parser.ParseArgs(usage, nil, "Parity "+version.Version)
-	if err != nil {
-		if strings.Contains(err.Error(), "help requested") {
-			fmt.Println(usage)
-			osExit(0)
-			return nil
-		}
-		return fmt.Errorf("parsing arguments: %w", err)
-	}
-
-	switch {
-	case arguments["--help"] != nil && arguments["--help"].(bool):
-		fmt.Println(usage)
-		osExit(0)
-		return nil
-	case arguments["--start"] != nil && arguments["--start"].(bool):
-		return startServer()
-	default:
-		fmt.Println(usage)
-		return nil
-	}
-}
-
-// startServer initializes and runs the server with graceful shutdown handling.
-func startServer() error {
+func startServer(cmd *cobra.Command, args []string) error {
 	opts := api.ServerOptions{
-		Port:    "5555",
-		Prefork: false,
+		Port:    viper.GetString("server.port"),
+		Prefork: viper.GetBool("server.prefork"),
 	}
 	server := api.NewServer(opts)
 
-	// Channel to listen for OS termination signals.
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 
-	// Start the server in a separate goroutine.
 	go func() {
 		if err := server.Start(); err != nil {
 			log.Fatalf("Failed to start server: %v", err)
 		}
 	}()
 
-	// Block until an OS signal is received.
 	<-quit
 	log.Println("Received shutdown signal, stopping server...")
-
-	// Perform graceful shutdown.
 	if err := server.Shutdown(); err != nil {
 		log.Fatalf("Error shutting down: %v", err)
 	}
 
 	log.Println("Server shutdown successfully")
 	return nil
+}
+
+func validateConfig() error {
+	fmt.Println("Validating configuration...")
+	// Implement config validation logic
+	return nil
+}
+
+// runValidation executes validation with a custom spinner.
+func runValidation() error {
+	// Choose a spinner style
+	w := spinner.New(spinner.CharSets[9], 100*time.Millisecond)
+	w.Start()
+
+	// Simulate validation work
+	time.Sleep(3 * time.Second)
+
+	// Stop spinner and persist final output
+	w.Stop()
+
+	return nil
+}
+
+func init() {
+	// Initialize logger
+	logger.InitLogger()
+	// Initialize Viper for configuration
+	viper.SetConfigName("config")
+	viper.SetConfigType("yaml")
+	viper.AddConfigPath(".")
+
+	if err := viper.ReadInConfig(); err != nil {
+		log.Printf("No config file found: %v", err)
+	}
 }

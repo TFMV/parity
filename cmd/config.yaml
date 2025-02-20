@@ -1,0 +1,43 @@
+DB1:
+  type: postgres
+  host: localhost
+  port: 5432
+  user: postgres
+  password: postgres
+  dbname: postgres
+  tables:
+    - name: table1
+      primary_key: id
+      sharding:
+        key: business_id
+        strategy: hash  # Options: hash, range, list, etc.
+    - name: table2
+      primary_key: id
+      sharding:
+        key: business_id
+        strategy: range
+    - name: table3
+      primary_key: id
+      partitioning:
+        key: business_id
+        type: range  # Options: range, list, hash
+      sampling: true
+      sample_rate: 0.1
+      sample_column: id
+
+DB2:
+  type: duckdb
+  path: /path/to/duckdb/file.db
+  tables:
+    - name: table1
+      primary_key: id
+      partitioning:
+        key: business_id
+        type: hash
+    - name: table2
+      primary_key: id
+      partitioning:
+        key: business_id
+        type: list
+    - name: table3
+      primary_key: id
