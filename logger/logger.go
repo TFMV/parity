@@ -123,3 +123,32 @@ func Debug(msg string, fields ...zap.Field) {
 		log.Debug(msg, fields...)
 	}
 }
+
+// Info logs an info message with structured fields
+func Info(msg string, fields ...zap.Field) {
+	if log != nil {
+		log.Info(msg, fields...)
+	}
+}
+
+// Warn logs a warning message with structured fields
+func Warn(msg string, fields ...zap.Field) {
+	if log != nil {
+		log.Warn(msg, fields...)
+	}
+}
+
+// Error logs an error message with structured fields
+func Error(msg string, fields ...zap.Field) {
+	if log != nil {
+		log.Error(msg, fields...)
+	}
+}
+
+// Fatal logs a fatal message with structured fields and then calls os.Exit(1)
+func Fatal(msg string, fields ...zap.Field) {
+	if log != nil {
+		log.Fatal(msg, fields...)
+	}
+	os.Exit(1)
+}
