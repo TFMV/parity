@@ -2,6 +2,7 @@
 package logger
 
 import (
+	"fmt"
 	"os"
 	"sync"
 
@@ -12,8 +13,13 @@ import (
 var (
 	log     *zap.Logger
 	once    sync.Once
-	logFile = "parity.log" // Default log file
+	logPath = "parity.log" // default path
 )
+
+// SetLogPath allows changing the log file location before initialization
+func SetLogPath(path string) {
+	logPath = path
+}
 
 // InitLogger initializes the Zap logger with structured logging.
 func InitLogger() {
@@ -23,7 +29,10 @@ func InitLogger() {
 
 		// Configure file logging
 		fileEncoder := zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig())
-		file, _ := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		if err != nil {
+			panic(fmt.Sprintf("Failed to open log file: %v", err))
+		}
 		fileCore := zapcore.NewCore(fileEncoder, zapcore.AddSync(file), level)
 
 		// Configure console logging
@@ -50,5 +59,21 @@ func GetLogger() *zap.Logger {
 func Sync() {
 	if log != nil {
 		_ = log.Sync()
+	}
+}
+
+// ResetLogger resets the logger state for testing
+func ResetLogger() {
+	if log != nil {
+		log.Sync()
+		log = nil
+	}
+	once = sync.Once{}
+}
+
+// Debug logs a debug message with structured fields
+func Debug(msg string, fields ...zap.Field) {
+	if log != nil {
+		log.Debug(msg, fields...)
 	}
 }
