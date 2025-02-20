@@ -9,6 +9,37 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 )
 
+// Options holds configuration options for database connections
+type Options struct {
+	Context    context.Context
+	Path       string
+	DriverPath string
+}
+
+// Option is a function that configures Options
+type Option func(*Options)
+
+// WithContext sets the context for database operations
+func WithContext(ctx context.Context) Option {
+	return func(o *Options) {
+		o.Context = ctx
+	}
+}
+
+// WithPath sets the database connection path/URI
+func WithPath(path string) Option {
+	return func(o *Options) {
+		o.Path = path
+	}
+}
+
+// WithDriverPath sets the path to the database driver
+func WithDriverPath(path string) Option {
+	return func(o *Options) {
+		o.DriverPath = path
+	}
+}
+
 // Database represents any database that can be used for comparison
 type Database interface {
 	// OpenConnection creates a new connection to the database
