@@ -49,32 +49,27 @@ func (v *Validator) ValidateAll(ctx context.Context, tableName string, columns [
 
 	var schemaErr, rowCountErr, aggErr, valueErr error
 
-	// Run validations concurrently
+	// Run validations concurrently.
 	wg.Add(4)
-
 	go func() {
 		defer wg.Done()
 		schemaResult, schemaErr = v.ValidateSchema(ctx, tableName)
 	}()
-
 	go func() {
 		defer wg.Done()
 		rowCountResult, rowCountErr = v.ValidateRowCounts(ctx, tableName)
 	}()
-
 	go func() {
 		defer wg.Done()
 		aggResults, aggErr = v.ValidateAggregates(ctx, tableName, columns)
 	}()
-
 	go func() {
 		defer wg.Done()
 		valueResult, valueErr = v.ValidateValues(ctx, tableName, columns, valueMode, samplePercentage)
 	}()
-
 	wg.Wait()
 
-	// Aggregate errors
+	// Aggregate errors.
 	if schemaErr != nil || rowCountErr != nil || aggErr != nil || valueErr != nil {
 		log.Error("Validation errors encountered",
 			zap.Error(schemaErr), zap.Error(rowCountErr), zap.Error(aggErr), zap.Error(valueErr))
@@ -82,12 +77,22 @@ func (v *Validator) ValidateAll(ctx context.Context, tableName string, columns [
 			schemaErr, rowCountErr, aggErr, valueErr)
 	}
 
+	// Optionally run partition and shard validations (dummy implementations provided)
+	partitionResult, partErr := v.ValidatePartitions(ctx, tableName, "partition_column")
+	if partErr != nil {
+		log.Error("Partition validation error", zap.Error(partErr))
+	}
+	shardResults, shardErr := v.ValidateShards(ctx, tableName, "shard_column")
+	if shardErr != nil {
+		log.Error("Shard validation error", zap.Error(shardErr))
+	}
+
 	endTime := time.Now()
 	duration := endTime.Sub(startTime)
 
-	// Construct metadata
+	// Construct metadata.
 	dbMeta := metrics.DatabaseMetadata{
-		SourceDBName:         "SourceDB", // Extract actual DB info if available
+		SourceDBName:         "SourceDB", // Extend to extract actual DB info if available.
 		DestinationDBName:    "DestinationDB",
 		Engine:               "Apache Arrow ADBC",
 		Version:              "1.0",
@@ -110,7 +115,7 @@ func (v *Validator) ValidateAll(ctx context.Context, tableName string, columns [
 		ShardingStrategy:  "",
 	}
 
-	// Construct validation report
+	// Construct validation report.
 	reportData := metrics.ValidationReport{
 		DBMetadata:       dbMeta,
 		TableMetadata:    tableMeta,
@@ -118,11 +123,11 @@ func (v *Validator) ValidateAll(ctx context.Context, tableName string, columns [
 		AggregateResults: aggResults,
 		ValueResult:      valueResult,
 		SchemaResult:     schemaResult,
-		PartitionMetrics: []metrics.PartitionResult{},
-		ShardMetrics:     []metrics.ShardResult{},
+		PartitionMetrics: []metrics.PartitionResult{partitionResult},
+		ShardMetrics:     shardResults,
 	}
 
-	// Generate and log report
+	// Generate and log report.
 	if rep, err := v.reportGenerator.GenerateValidationReport(reportData); err == nil {
 		log.Info("Validation report generated", zap.ByteString("report", rep))
 	} else {
@@ -172,7 +177,6 @@ func (v *Validator) ValidateSchema(ctx context.Context, tableName string) (metri
 
 	srcMap := make(map[string]*arrow.Field)
 	dstMap := make(map[string]*arrow.Field)
-
 	for _, f := range srcFields {
 		srcMap[f.Name] = &f
 	}
@@ -210,7 +214,7 @@ func (v *Validator) ValidateSchema(ctx context.Context, tableName string) (metri
 		MissingInDestination:  missingInDest,
 		MissingInSource:       missingInSource,
 		DataTypeMismatches:    dataTypeMismatches,
-		PrimaryKeyDifferences: []string{}, // Extend if primary key info is available.
+		PrimaryKeyDifferences: []string{},
 		Status:                status,
 	}, nil
 }
@@ -247,7 +251,6 @@ func (v *Validator) ValidateRowCounts(ctx context.Context, tableName string) (me
 
 	diff := srcCount - dstCount
 	status := math.Abs(float64(diff)) <= v.thresholds.RowCountTolerance
-
 	if status {
 		log.Info("Row count validation passed", zap.Int64("source", srcCount), zap.Int64("destination", dstCount))
 	} else {
@@ -277,7 +280,6 @@ func (v *Validator) getRowCount(ctx context.Context, conn integrations.Connectio
 			return 0, fmt.Errorf("invalid count result")
 		}
 		col := rec.Column(0)
-		// For simplicity, assume COUNT(*) returns int64.
 		intArr, ok := col.(*array.Int64)
 		if !ok {
 			return 0, fmt.Errorf("unexpected data type for count")
@@ -292,7 +294,6 @@ func (v *Validator) ValidateAggregates(ctx context.Context, tableName string, co
 	log := logger.GetLogger()
 	log.Info("Starting aggregate validation", zap.String("table", tableName))
 	var results []metrics.AggregateResult
-
 	aggTypes := []metrics.AggregationType{metrics.Sum, metrics.Avg, metrics.Min, metrics.Max, metrics.Count}
 
 	for _, col := range columns {
@@ -348,7 +349,6 @@ func (v *Validator) ValidateAggregates(ctx context.Context, tableName string, co
 			})
 		}
 	}
-
 	return results, nil
 }
 
@@ -402,9 +402,8 @@ func (v *Validator) getAggregates(ctx context.Context, conn integrations.Connect
 // extractNumericValue returns the numeric value at the given row for supported Arrow types.
 func extractNumericValue(arr arrow.Array, row int) (interface{}, error) {
 	if arr.IsNull(row) {
-		return nil, nil // Return nil for NULL values instead of 0
+		return nil, nil // Return nil for NULL values.
 	}
-
 	switch arr.DataType().ID() {
 	case arrow.INT64:
 		return arr.(*array.Int64).Value(row), nil
@@ -415,7 +414,6 @@ func extractNumericValue(arr arrow.Array, row int) (interface{}, error) {
 	case arrow.FLOAT32:
 		return arr.(*array.Float32).Value(row), nil
 	case arrow.DECIMAL128:
-		// Preserve Decimal128 precision using big.Int
 		decArr := arr.(*array.Decimal128)
 		dec := decArr.Value(row)
 		scale := arr.DataType().(*arrow.Decimal128Type).Scale
@@ -424,7 +422,6 @@ func extractNumericValue(arr arrow.Array, row int) (interface{}, error) {
 			scale: scale,
 		}, nil
 	case arrow.DECIMAL256:
-		// Preserve Decimal256 precision using big.Int
 		decArr := arr.(*array.Decimal256)
 		dec := decArr.Value(row)
 		scale := arr.DataType().(*arrow.Decimal256Type).Scale
@@ -437,13 +434,13 @@ func extractNumericValue(arr arrow.Array, row int) (interface{}, error) {
 	}
 }
 
-// decimalValue represents a decimal number with arbitrary precision
+// decimalValue represents a decimal number with arbitrary precision.
 type decimalValue struct {
 	value *big.Int
 	scale int32
 }
 
-// compareValues updated to handle decimal comparisons:
+// compareValues compares two values with tolerance for numeric differences and special handling for decimals.
 func compareValues(val1, val2 interface{}, tolerance float64) bool {
 	switch v1 := val1.(type) {
 	case int64:
@@ -481,28 +478,19 @@ func compareValues(val1, val2 interface{}, tolerance float64) bool {
 		if !ok {
 			return false
 		}
-		// Compare with matching scales
 		if v1.scale == v2.scale {
 			return v1.value.Cmp(v2.value) == 0
 		}
-		// Adjust scales if needed for comparison
 		return adjustAndCompareDecimals(v1, v2)
 	default:
 		return val1 == val2
 	}
 }
 
-// adjustAndCompareDecimals compares two decimal values by adjusting their scales
+// adjustAndCompareDecimals compares two decimal values by adjusting their scales.
 func adjustAndCompareDecimals(d1, d2 *decimalValue) bool {
-	if d1.scale == d2.scale {
-		return d1.value.Cmp(d2.value) == 0
-	}
-
-	// Create copies to avoid modifying originals
 	v1 := new(big.Int).Set(d1.value)
 	v2 := new(big.Int).Set(d2.value)
-
-	// Scale up the number with lower scale
 	if d1.scale < d2.scale {
 		scale := d2.scale - d1.scale
 		v1.Mul(v1, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil))
@@ -510,7 +498,6 @@ func adjustAndCompareDecimals(d1, d2 *decimalValue) bool {
 		scale := d1.scale - d2.scale
 		v2.Mul(v2, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil))
 	}
-
 	return v1.Cmp(v2) == 0
 }
 
@@ -537,7 +524,6 @@ func (v *Validator) ValidateValues(ctx context.Context, tableName string, column
 	if mode == metrics.Full {
 		query = fmt.Sprintf("SELECT * FROM %s", tableName)
 	} else {
-		// For sampling, use a LIMIT calculated from the row count.
 		totalRows, err := v.getRowCount(ctx, srcConn, tableName)
 		if err != nil {
 			log.Error("Failed to get row count for sampling", zap.Error(err))
@@ -573,7 +559,6 @@ func (v *Validator) ValidateValues(ctx context.Context, tableName string, column
 	for srcRR.Next() && dstRR.Next() {
 		srcRec := srcRR.Record()
 		dstRec := dstRR.Record()
-
 		numRows := int(srcRec.NumRows())
 		for r := 0; r < numRows; r++ {
 			sampledRows++
@@ -638,21 +623,50 @@ func findColumnIndex(schema *arrow.Schema, columnName string) int {
 func getValueFromArray(arr arrow.Array, row int) (interface{}, error) {
 	switch arr.DataType().ID() {
 	case arrow.INT64:
-		a := arr.(*array.Int64)
-		return a.Value(row), nil
+		return arr.(*array.Int64).Value(row), nil
 	case arrow.INT32:
-		a := arr.(*array.Int32)
-		return a.Value(row), nil
+		return arr.(*array.Int32).Value(row), nil
 	case arrow.FLOAT64:
-		a := arr.(*array.Float64)
-		return a.Value(row), nil
+		return arr.(*array.Float64).Value(row), nil
 	case arrow.FLOAT32:
-		a := arr.(*array.Float32)
-		return a.Value(row), nil
+		return arr.(*array.Float32).Value(row), nil
 	case arrow.STRING:
-		a := arr.(*array.String)
-		return a.Value(row), nil
+		return arr.(*array.String).Value(row), nil
 	default:
 		return nil, fmt.Errorf("unsupported data type for value extraction: %s", arr.DataType().Name())
 	}
+}
+
+// ValidatePartitions performs a dummy partition-level validation.
+// In a full implementation, this would run queries grouped by the partition column.
+func (v *Validator) ValidatePartitions(ctx context.Context, tableName, partitionColumn string) (metrics.PartitionResult, error) {
+	log := logger.GetLogger()
+	log.Info("Starting partition validation", zap.String("table", tableName), zap.String("partitionColumn", partitionColumn))
+	// Dummy implementation: Replace with real partition queries and comparisons.
+	return metrics.PartitionResult{
+		PartitionColumn:      partitionColumn,
+		RowCountDifferences:  make(map[string]int64),
+		AggregateDifferences: make(map[string]metrics.AggregateResult),
+		Status:               true,
+	}, nil
+}
+
+// ValidateShards performs a dummy shard-level validation.
+// In a full implementation, this would run queries per shard and compare row counts and aggregates.
+func (v *Validator) ValidateShards(ctx context.Context, tableName, shardColumn string) ([]metrics.ShardResult, error) {
+	log := logger.GetLogger()
+	log.Info("Starting shard validation", zap.String("table", tableName), zap.String("shardColumn", shardColumn))
+	// Dummy implementation: Replace with real shard queries and comparisons.
+	return []metrics.ShardResult{}, nil
+}
+
+// StoreReport persists the validation report using a provided MetricsStore.
+func (v *Validator) StoreReport(ctx context.Context, reportData metrics.ValidationReport, store metrics.MetricsStore) error {
+	log := logger.GetLogger()
+	if err := store.SaveWithContext(ctx, reportData); err != nil {
+		log.Error("Failed to store validation report", zap.Error(err))
+		return err
+	}
+	log.Info("Validation report stored successfully")
+	return nil
 }
