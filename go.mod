@@ -7,6 +7,7 @@ require (
 	github.com/apache/arrow-go/v18 v18.1.1-0.20250116162745-f533d2066dee
 	github.com/docopt/docopt-go v0.0.0-20180111231733-ee0de3bc6815
 	github.com/gofiber/fiber/v2 v2.52.6
+	go.uber.org/zap v1.27.0
 )
 
 require (
@@ -25,6 +26,7 @@ require (
 	github.com/valyala/fasthttp v1.51.0 // indirect
 	github.com/valyala/tcplisten v1.0.0 // indirect
 	github.com/zeebo/xxh3 v1.0.2 // indirect
+	go.uber.org/multierr v1.10.0 // indirect
 	golang.org/x/exp v0.0.0-20240909161429-701f63a606c0 // indirect
 	golang.org/x/mod v0.22.0 // indirect
 	golang.org/x/sync v0.10.0 // indirect

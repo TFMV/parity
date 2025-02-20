@@ -51,7 +51,7 @@ func runCLI() error {
 
 // startServer initializes and runs the server with graceful shutdown handling.
 func startServer() error {
-	server := api.NewServer()
+	server := api.NewServer("5555")
 
 	// Channel to listen for OS termination signals.
 	quit := make(chan os.Signal, 1)
@@ -59,7 +59,7 @@ func startServer() error {
 
 	// Start the server in a separate goroutine.
 	go func() {
-		if err := server.Start("5555"); err != nil {
+		if err := server.Start(); err != nil {
 			log.Fatalf("Failed to start server: %v", err)
 		}
 	}()
