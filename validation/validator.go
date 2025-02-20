@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/big"
 	"sync"
 	"time"
 
@@ -298,12 +299,27 @@ func (v *Validator) ValidateAggregates(ctx context.Context, tableName string, co
 		query := fmt.Sprintf("SELECT SUM(%s), AVG(%s), MIN(%s), MAX(%s), COUNT(%s) FROM %s",
 			col, col, col, col, col, tableName)
 
-		srcAgg, err := v.getAggregates(ctx, v.integration.Source1(), query)
+		srcConn, err := v.integration.Source1().OpenConnection()
+		if err != nil {
+			log.Error("Failed to open source connection", zap.Error(err))
+			return nil, err
+		}
+		defer srcConn.Close()
+
+		srcAgg, err := v.getAggregates(ctx, srcConn, query)
 		if err != nil {
 			log.Error("Failed to get source aggregates", zap.String("column", col), zap.Error(err))
 			return nil, err
 		}
-		dstAgg, err := v.getAggregates(ctx, v.integration.Source2(), query)
+
+		dstConn, err := v.integration.Source2().OpenConnection()
+		if err != nil {
+			log.Error("Failed to open destination connection", zap.Error(err))
+			return nil, err
+		}
+		defer dstConn.Close()
+
+		dstAgg, err := v.getAggregates(ctx, dstConn, query)
 		if err != nil {
 			log.Error("Failed to get destination aggregates", zap.String("column", col), zap.Error(err))
 			return nil, err
@@ -337,13 +353,7 @@ func (v *Validator) ValidateAggregates(ctx context.Context, tableName string, co
 }
 
 // getAggregates runs the provided aggregate query on the given database and extracts 5 numeric values.
-func (v *Validator) getAggregates(ctx context.Context, db integrations.Database, query string) ([]float64, error) {
-	conn, err := db.OpenConnection()
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
+func (v *Validator) getAggregates(ctx context.Context, conn integrations.Connection, query string) ([]float64, error) {
 	rr, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, err
@@ -362,7 +372,27 @@ func (v *Validator) getAggregates(ctx context.Context, db integrations.Database,
 			if err != nil {
 				return nil, err
 			}
-			aggregates = append(aggregates, val)
+
+			// Convert different numeric types to float64
+			switch v := val.(type) {
+			case float64:
+				aggregates = append(aggregates, v)
+			case float32:
+				aggregates = append(aggregates, float64(v))
+			case int64:
+				aggregates = append(aggregates, float64(v))
+			case int32:
+				aggregates = append(aggregates, float64(v))
+			case *decimalValue:
+				// Convert decimal to float64 for aggregates
+				f, _ := v.value.Float64()
+				if v.scale > 0 {
+					f = f / math.Pow10(int(v.scale))
+				}
+				aggregates = append(aggregates, f)
+			default:
+				return nil, fmt.Errorf("unsupported aggregate type: %T", val)
+			}
 		}
 		return aggregates, nil
 	}
@@ -370,27 +400,118 @@ func (v *Validator) getAggregates(ctx context.Context, db integrations.Database,
 }
 
 // extractNumericValue returns the numeric value at the given row for supported Arrow types.
-func extractNumericValue(arr arrow.Array, row int) (float64, error) {
+func extractNumericValue(arr arrow.Array, row int) (interface{}, error) {
 	if arr.IsNull(row) {
-		return 0, nil
+		return nil, nil // Return nil for NULL values instead of 0
 	}
 
 	switch arr.DataType().ID() {
 	case arrow.INT64:
-		return float64(arr.(*array.Int64).Value(row)), nil
+		return arr.(*array.Int64).Value(row), nil
 	case arrow.INT32:
-		return float64(arr.(*array.Int32).Value(row)), nil
+		return arr.(*array.Int32).Value(row), nil
 	case arrow.FLOAT64:
 		return arr.(*array.Float64).Value(row), nil
 	case arrow.FLOAT32:
-		return float64(arr.(*array.Float32).Value(row)), nil
-	case arrow.DECIMAL128, arrow.DECIMAL256:
-		// Handle decimal types by converting to float64
-		dec := arr.(*array.Decimal128).Value(row)
-		return dec.ToFloat64(arr.DataType().(*arrow.Decimal128Type).Scale), nil
+		return arr.(*array.Float32).Value(row), nil
+	case arrow.DECIMAL128:
+		// Preserve Decimal128 precision using big.Int
+		decArr := arr.(*array.Decimal128)
+		dec := decArr.Value(row)
+		scale := arr.DataType().(*arrow.Decimal128Type).Scale
+		return &decimalValue{
+			value: dec.BigInt(),
+			scale: scale,
+		}, nil
+	case arrow.DECIMAL256:
+		// Preserve Decimal256 precision using big.Int
+		decArr := arr.(*array.Decimal256)
+		dec := decArr.Value(row)
+		scale := arr.DataType().(*arrow.Decimal256Type).Scale
+		return &decimalValue{
+			value: dec.BigInt(),
+			scale: scale,
+		}, nil
 	default:
-		return 0, fmt.Errorf("unsupported data type for numeric extraction: %s", arr.DataType().Name())
+		return nil, fmt.Errorf("unsupported data type for numeric extraction: %s", arr.DataType().Name())
 	}
+}
+
+// decimalValue represents a decimal number with arbitrary precision
+type decimalValue struct {
+	value *big.Int
+	scale int32
+}
+
+// compareValues updated to handle decimal comparisons:
+func compareValues(val1, val2 interface{}, tolerance float64) bool {
+	switch v1 := val1.(type) {
+	case int64:
+		v2, ok := val2.(int64)
+		if !ok {
+			return false
+		}
+		return v1 == v2
+	case int32:
+		v2, ok := val2.(int32)
+		if !ok {
+			return false
+		}
+		return v1 == v2
+	case float64:
+		v2, ok := val2.(float64)
+		if !ok {
+			return false
+		}
+		return math.Abs(v1-v2) <= tolerance
+	case float32:
+		v2, ok := val2.(float32)
+		if !ok {
+			return false
+		}
+		return math.Abs(float64(v1)-float64(v2)) <= tolerance
+	case string:
+		v2, ok := val2.(string)
+		if !ok {
+			return false
+		}
+		return v1 == v2
+	case *decimalValue:
+		v2, ok := val2.(*decimalValue)
+		if !ok {
+			return false
+		}
+		// Compare with matching scales
+		if v1.scale == v2.scale {
+			return v1.value.Cmp(v2.value) == 0
+		}
+		// Adjust scales if needed for comparison
+		return adjustAndCompareDecimals(v1, v2)
+	default:
+		return val1 == val2
+	}
+}
+
+// adjustAndCompareDecimals compares two decimal values by adjusting their scales
+func adjustAndCompareDecimals(d1, d2 *decimalValue) bool {
+	if d1.scale == d2.scale {
+		return d1.value.Cmp(d2.value) == 0
+	}
+
+	// Create copies to avoid modifying originals
+	v1 := new(big.Int).Set(d1.value)
+	v2 := new(big.Int).Set(d2.value)
+
+	// Scale up the number with lower scale
+	if d1.scale < d2.scale {
+		scale := d2.scale - d1.scale
+		v1.Mul(v1, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil))
+	} else {
+		scale := d1.scale - d2.scale
+		v2.Mul(v2, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil))
+	}
+
+	return v1.Cmp(v2) == 0
 }
 
 // ValidateValues performs full or sampled row‑level validation for specified columns.
@@ -533,43 +654,5 @@ func getValueFromArray(arr arrow.Array, row int) (interface{}, error) {
 		return a.Value(row), nil
 	default:
 		return nil, fmt.Errorf("unsupported data type for value extraction: %s", arr.DataType().Name())
-	}
-}
-
-// compareValues checks equality for non‐numeric types or allows a tolerance for numeric differences.
-func compareValues(val1, val2 interface{}, tolerance float64) bool {
-	switch v1 := val1.(type) {
-	case int64:
-		v2, ok := val2.(int64)
-		if !ok {
-			return false
-		}
-		return v1 == v2
-	case int32:
-		v2, ok := val2.(int32)
-		if !ok {
-			return false
-		}
-		return v1 == v2
-	case float64:
-		v2, ok := val2.(float64)
-		if !ok {
-			return false
-		}
-		return math.Abs(v1-v2) <= tolerance
-	case float32:
-		v2, ok := val2.(float32)
-		if !ok {
-			return false
-		}
-		return math.Abs(float64(v1)-float64(v2)) <= tolerance
-	case string:
-		v2, ok := val2.(string)
-		if !ok {
-			return false
-		}
-		return v1 == v2
-	default:
-		return val1 == val2
 	}
 }
