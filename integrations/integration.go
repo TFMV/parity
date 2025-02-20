@@ -68,6 +68,10 @@ type Integration interface {
 	Source1() Database
 	// Source2 returns the second database
 	Source2() Database
+	// Close closes both databases
+	Close()
+	// ConnCount returns total number of open connections
+	ConnCount() int
 }
 
 // DatabasePair implements Integration for any two databases

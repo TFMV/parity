@@ -20,8 +20,13 @@ type Server struct {
 	port string
 }
 
+type ServerOptions struct {
+	Port    string
+	Prefork bool
+}
+
 // NewServer initializes a new Fiber instance with best practices
-func NewServer(port string) *Server {
+func NewServer(opts ServerOptions) *Server {
 	// Initialize Zap logger
 	logger.InitLogger()
 	log := logger.GetLogger()
@@ -30,7 +35,7 @@ func NewServer(port string) *Server {
 		IdleTimeout:  10 * time.Second,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
-		Prefork:      true,
+		Prefork:      opts.Prefork,
 	})
 
 	// Middleware
@@ -70,7 +75,7 @@ func NewServer(port string) *Server {
 		})
 	})
 
-	return &Server{app: app, log: log, port: port}
+	return &Server{app: app, log: log, port: opts.Port}
 }
 
 // Start runs the Fiber server and handles graceful shutdown
@@ -111,4 +116,9 @@ func (s *Server) Start() error {
 func (s *Server) Shutdown() error {
 	s.log.Warn("Manual shutdown requested")
 	return s.app.Shutdown()
+}
+
+// GetApp returns the underlying Fiber app
+func (s *Server) GetApp() *fiber.App {
+	return s.app
 }

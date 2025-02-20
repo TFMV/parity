@@ -6,12 +6,15 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/TFMV/parity/api"
 	"github.com/TFMV/parity/version"
 	"github.com/docopt/docopt-go"
 )
+
+var osExit = os.Exit // Allow overriding for tests
 
 func main() {
 	if err := runCLI(); err != nil {
@@ -30,28 +33,50 @@ func runCLI() error {
 		--start        Start the parity server
 	`
 
-	arguments, err := docopt.ParseArgs(usage, nil, "Parity "+version.Version)
+	// Handle version flag directly first
+	for _, arg := range os.Args[1:] {
+		if arg == "--version" || arg == "-v" {
+			fmt.Println("Parity", version.Version)
+			osExit(0)
+			return nil
+		}
+	}
+
+	parser := &docopt.Parser{
+		HelpHandler:  func(err error, usage string) {},
+		OptionsFirst: true,
+	}
+
+	arguments, err := parser.ParseArgs(usage, nil, "Parity "+version.Version)
 	if err != nil {
+		if strings.Contains(err.Error(), "help requested") {
+			fmt.Println(usage)
+			osExit(0)
+			return nil
+		}
 		return fmt.Errorf("parsing arguments: %w", err)
 	}
 
 	switch {
-	case arguments["--version"].(bool):
-		fmt.Println("Parity", version.Version)
-
-	case arguments["--start"].(bool):
+	case arguments["--help"] != nil && arguments["--help"].(bool):
+		fmt.Println(usage)
+		osExit(0)
+		return nil
+	case arguments["--start"] != nil && arguments["--start"].(bool):
 		return startServer()
-
 	default:
 		fmt.Println(usage)
+		return nil
 	}
-
-	return nil
 }
 
 // startServer initializes and runs the server with graceful shutdown handling.
 func startServer() error {
-	server := api.NewServer("5555")
+	opts := api.ServerOptions{
+		Port:    "5555",
+		Prefork: false,
+	}
+	server := api.NewServer(opts)
 
 	// Channel to listen for OS termination signals.
 	quit := make(chan os.Signal, 1)
