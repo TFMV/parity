@@ -24,3 +24,5 @@ go.work.sum
 # env file
 .env
 data/
+validation/parity.log
+.DS_Store
