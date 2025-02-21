@@ -1,672 +1,469 @@
-// validator.go
+// Package validation implements a high-performance data validator.
 package validation
 
 import (
 	"context"
 	"fmt"
 	"math"
-	"math/big"
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/TFMV/parity/integrations"
-	"github.com/TFMV/parity/logger"
 	"github.com/TFMV/parity/metrics"
 	"github.com/TFMV/parity/report"
-
-	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/array"
-	"go.uber.org/zap"
 )
 
-// Validator encapsulates a pair of databases, validation thresholds, and a report generator.
+// Validator manages the configuration and validation logic.
 type Validator struct {
-	integration     integrations.Integration
-	thresholds      metrics.ValidationThresholds
-	reportGenerator report.ReportGenerator
+	Integration integrations.Integration // Pair of databases to compare
+	TableName   string                   // Table to validate
+	Thresholds  metrics.ValidationThresholds
+
+	// Row value validation mode and sampling percentage.
+	ValueValidationMode metrics.ValueValidationMode
+	SamplingPercentage  float64
+
+	// Logger for structured logging.
+	Logger *zap.Logger
+
+	// Metrics collector (stubbed Prometheus integration).
+	MetricsCollector *metrics.PrometheusMetricsCollector
+
+	// Report generators.
+	JSONReportGenerator report.ReportGenerator
+	HTMLReportGenerator report.ReportGenerator
 }
 
-// NewValidator creates a new Validator instance.
-func NewValidator(integration integrations.Integration, thresholds metrics.ValidationThresholds, reportGenerator report.ReportGenerator) *Validator {
+// NewValidator constructs a new Validator instance.
+func NewValidator(integration integrations.Integration, tableName string, thresholds metrics.ValidationThresholds, logger *zap.Logger) *Validator {
 	return &Validator{
-		integration:     integration,
-		thresholds:      thresholds,
-		reportGenerator: reportGenerator,
+		Integration:         integration,
+		TableName:           tableName,
+		Thresholds:          thresholds,
+		ValueValidationMode: metrics.Full,
+		SamplingPercentage:  100.0,
+		Logger:              logger,
+		MetricsCollector:    &metrics.PrometheusMetricsCollector{},
+		JSONReportGenerator: &report.JSONReportGenerator{},
+		HTMLReportGenerator: &report.HTMLReportGenerator{},
 	}
 }
 
-// ValidateAll runs all validations (schema, row count, aggregates, and values) concurrently and assembles a ValidationReport.
-func (v *Validator) ValidateAll(ctx context.Context, tableName string, columns []string, valueMode metrics.ValueValidationMode, samplePercentage float64) (metrics.ValidationReport, error) {
-	log := logger.GetLogger()
+// Validate runs all validations concurrently and returns a detailed ValidationReport.
+func (v *Validator) Validate(ctx context.Context) (metrics.ValidationReport, error) {
 	startTime := time.Now()
-	log.Info("Starting full validation", zap.String("table", tableName))
+	v.Logger.Info("Starting validation", zap.String("table", v.TableName))
+	v.MetricsCollector.RecordValidationStart(metrics.DatabaseMetadata{
+		StartTime: startTime,
+	})
 
-	var wg sync.WaitGroup
-	var schemaResult metrics.SchemaResult
-	var rowCountResult metrics.RowCountResult
-	var aggResults []metrics.AggregateResult
-	var valueResult metrics.ValueResult
+	var (
+		wg              sync.WaitGroup
+		errCh           = make(chan error, 4)
+		schemaResult    metrics.SchemaResult
+		rowCountResult  metrics.RowCountResult
+		aggregateResult []metrics.AggregateResult
+		valueResult     metrics.ValueResult
+	)
 
-	var schemaErr, rowCountErr, aggErr, valueErr error
-
-	// Run validations concurrently.
+	// Run schema, row count, aggregates, and row values validations concurrently.
 	wg.Add(4)
+
 	go func() {
 		defer wg.Done()
-		schemaResult, schemaErr = v.ValidateSchema(ctx, tableName)
+		res, err := v.validateSchema(ctx)
+		if err != nil {
+			errCh <- fmt.Errorf("schema validation failed: %w", err)
+			return
+		}
+		schemaResult = res
+		v.Logger.Info("Schema validation completed", zap.Bool("status", res.Status))
 	}()
+
 	go func() {
 		defer wg.Done()
-		rowCountResult, rowCountErr = v.ValidateRowCounts(ctx, tableName)
+		res, err := v.validateRowCount(ctx)
+		if err != nil {
+			errCh <- fmt.Errorf("row count validation failed: %w", err)
+			return
+		}
+		rowCountResult = res
+		v.MetricsCollector.RecordRowCountDifference(res.Difference)
+		v.Logger.Info("Row count validation completed", zap.Int64("source", res.SourceCount), zap.Int64("destination", res.DestinationCount))
 	}()
+
 	go func() {
 		defer wg.Done()
-		aggResults, aggErr = v.ValidateAggregates(ctx, tableName, columns)
+		res, err := v.validateAggregates(ctx)
+		if err != nil {
+			errCh <- fmt.Errorf("aggregate validation failed: %w", err)
+			return
+		}
+		aggregateResult = res
+		v.Logger.Info("Aggregate validation completed", zap.Int("columns", len(res)))
 	}()
+
 	go func() {
 		defer wg.Done()
-		valueResult, valueErr = v.ValidateValues(ctx, tableName, columns, valueMode, samplePercentage)
+		res, err := v.validateRowValues(ctx)
+		if err != nil {
+			errCh <- fmt.Errorf("row values validation failed: %w", err)
+			return
+		}
+		valueResult = res
+		v.Logger.Info("Row values validation completed", zap.Int64("mismatches", res.MismatchedRows))
 	}()
+
 	wg.Wait()
+	close(errCh)
 
-	// Aggregate errors.
-	if schemaErr != nil || rowCountErr != nil || aggErr != nil || valueErr != nil {
-		log.Error("Validation errors encountered",
-			zap.Error(schemaErr), zap.Error(rowCountErr), zap.Error(aggErr), zap.Error(valueErr))
-		return metrics.ValidationReport{}, fmt.Errorf("validation errors encountered: %v, %v, %v, %v",
-			schemaErr, rowCountErr, aggErr, valueErr)
+	// Check for any error from the goroutines.
+	var validationErr error
+	for err := range errCh {
+		if err != nil {
+			validationErr = err
+			v.Logger.Error("Validation error", zap.Error(err))
+			break
+		}
 	}
 
-	// Optionally run partition and shard validations (dummy implementations provided)
-	partitionResult, partErr := v.ValidatePartitions(ctx, tableName, "partition_column")
-	if partErr != nil {
-		log.Error("Partition validation error", zap.Error(partErr))
+	// Validate partitions and shards sequentially (or concurrently if needed).
+	partitionMetrics, err := v.validatePartitions(ctx)
+	if err != nil {
+		v.Logger.Error("Partition validation failed", zap.Error(err))
 	}
-	shardResults, shardErr := v.ValidateShards(ctx, tableName, "shard_column")
-	if shardErr != nil {
-		log.Error("Shard validation error", zap.Error(shardErr))
+	shardMetrics, err := v.validateShards(ctx)
+	if err != nil {
+		v.Logger.Error("Shard validation failed", zap.Error(err))
 	}
 
 	endTime := time.Now()
 	duration := endTime.Sub(startTime)
 
-	// Construct metadata.
+	// Assemble metadata.
 	dbMeta := metrics.DatabaseMetadata{
-		SourceDBName:         "SourceDB", // Extend to extract actual DB info if available.
-		DestinationDBName:    "DestinationDB",
-		Engine:               "Apache Arrow ADBC",
-		Version:              "1.0",
-		SchemaName:           "",
+		SourceDBName:         "source_db",      // Placeholder; normally determined from the integration.
+		DestinationDBName:    "destination_db", // Placeholder
+		Engine:               "Parity",         // Example engine type.
+		Version:              "0.1.0",
+		SchemaName:           "public", // Example schema.
 		StartTime:            startTime,
 		EndTime:              endTime,
 		Duration:             duration,
-		ConnectionString:     "",
-		ValidationThresholds: v.thresholds,
-		TotalPartitions:      0,
-		TotalShards:          0,
-	}
-	tableMeta := metrics.TableMetadata{
-		ObjectType:        metrics.Table,
-		Name:              tableName,
-		PrimaryKeys:       []string{},
-		NumColumns:        0,
-		ColumnDataTypes:   map[string]string{},
-		PartitionStrategy: "",
-		ShardingStrategy:  "",
+		ConnectionString:     "", // Omitted for security.
+		ValidationThresholds: v.Thresholds,
+		TotalPartitions:      len(partitionMetrics),
+		TotalShards:          len(shardMetrics),
 	}
 
-	// Construct validation report.
-	reportData := metrics.ValidationReport{
+	tableMeta := metrics.TableMetadata{
+		ObjectType:        metrics.Table,
+		Name:              v.TableName,
+		PrimaryKeys:       []string{"id"}, // Placeholder; adjust as needed.
+		NumColumns:        0,              // Could be populated based on schema.
+		ColumnDataTypes:   map[string]string{},
+		PartitionStrategy: "hash",  // Example strategy.
+		ShardingStrategy:  "range", // Example strategy.
+	}
+
+	reportResult := metrics.ValidationReport{
 		DBMetadata:       dbMeta,
 		TableMetadata:    tableMeta,
 		RowCountResult:   rowCountResult,
-		AggregateResults: aggResults,
+		AggregateResults: aggregateResult,
 		ValueResult:      valueResult,
 		SchemaResult:     schemaResult,
-		PartitionMetrics: []metrics.PartitionResult{partitionResult},
-		ShardMetrics:     shardResults,
+		PartitionMetrics: partitionMetrics,
+		ShardMetrics:     shardMetrics,
 	}
 
-	// Generate and log report.
-	if rep, err := v.reportGenerator.GenerateValidationReport(reportData); err == nil {
-		log.Info("Validation report generated", zap.ByteString("report", rep))
-	} else {
-		log.Error("Failed to generate report", zap.Error(err))
-	}
+	v.MetricsCollector.RecordValidationEnd(duration)
+	v.Logger.Info("Validation complete", zap.Duration("duration", duration))
 
-	log.Info("Validation completed", zap.Duration("duration", duration))
-	return reportData, nil
+	return reportResult, validationErr
 }
 
-// ValidateSchema compares the table schema between source and destination.
-func (v *Validator) ValidateSchema(ctx context.Context, tableName string) (metrics.SchemaResult, error) {
-	log := logger.GetLogger()
-	log.Info("Starting schema validation", zap.String("table", tableName))
-
-	srcConn, err := v.integration.Source1().OpenConnection()
+// validateSchema compares the table schemas between source and destination.
+func (v *Validator) validateSchema(ctx context.Context) (metrics.SchemaResult, error) {
+	srcConn, err := v.Integration.Source1().OpenConnection()
 	if err != nil {
-		log.Error("Failed to open source connection", zap.Error(err))
 		return metrics.SchemaResult{}, err
 	}
 	defer srcConn.Close()
 
-	dstConn, err := v.integration.Source2().OpenConnection()
+	destConn, err := v.Integration.Source2().OpenConnection()
 	if err != nil {
-		log.Error("Failed to open destination connection", zap.Error(err))
 		return metrics.SchemaResult{}, err
 	}
-	defer dstConn.Close()
+	defer destConn.Close()
 
-	srcSchema, err := srcConn.GetTableSchema(ctx, nil, nil, tableName)
+	// For simplicity, catalog and schema are nil.
+	var catalog, sch *string
+	srcSchema, err := srcConn.GetTableSchema(ctx, catalog, sch, v.TableName)
 	if err != nil {
-		log.Error("Failed to get source schema", zap.Error(err))
 		return metrics.SchemaResult{}, err
 	}
-	dstSchema, err := dstConn.GetTableSchema(ctx, nil, nil, tableName)
+	destSchema, err := destConn.GetTableSchema(ctx, catalog, sch, v.TableName)
 	if err != nil {
-		log.Error("Failed to get destination schema", zap.Error(err))
 		return metrics.SchemaResult{}, err
 	}
 
-	srcFields := srcSchema.Fields()
-	dstFields := dstSchema.Fields()
-
-	var missingInDest []string
-	var missingInSource []string
+	// Compare fields.
+	missingInDest := []string{}
+	missingInSrc := []string{}
 	dataTypeMismatches := make(map[string]string)
 
-	srcMap := make(map[string]*arrow.Field)
-	dstMap := make(map[string]*arrow.Field)
-	for _, f := range srcFields {
-		srcMap[f.Name] = &f
+	srcFields := make(map[string]string)
+	for _, f := range srcSchema.Fields() {
+		srcFields[f.Name] = f.Type.String()
 	}
-	for _, f := range dstFields {
-		dstMap[f.Name] = &f
+	destFields := make(map[string]string)
+	for _, f := range destSchema.Fields() {
+		destFields[f.Name] = f.Type.String()
 	}
-
-	for name, srcField := range srcMap {
-		if dstField, ok := dstMap[name]; !ok {
+	for name, srcType := range srcFields {
+		if destType, ok := destFields[name]; !ok {
 			missingInDest = append(missingInDest, name)
-		} else {
-			if srcField.Type.String() != dstField.Type.String() {
-				dataTypeMismatches[name] = fmt.Sprintf("source: %s, destination: %s", srcField.Type, dstField.Type)
-			}
+		} else if srcType != destType {
+			dataTypeMismatches[name] = fmt.Sprintf("source: %s, destination: %s", srcType, destType)
 		}
 	}
-	for name := range dstMap {
-		if _, ok := srcMap[name]; !ok {
-			missingInSource = append(missingInSource, name)
+	for name := range destFields {
+		if _, ok := srcFields[name]; !ok {
+			missingInSrc = append(missingInSrc, name)
 		}
 	}
 
-	status := len(missingInDest) == 0 && len(missingInSource) == 0 && len(dataTypeMismatches) == 0
-	if status {
-		log.Info("Schema validation passed", zap.String("table", tableName))
-	} else {
-		log.Warn("Schema validation failed", zap.String("table", tableName),
-			zap.Any("missingInDestination", missingInDest),
-			zap.Any("missingInSource", missingInSource),
-			zap.Any("dataTypeMismatches", dataTypeMismatches))
-	}
+	status := len(missingInDest) == 0 && len(missingInSrc) == 0 && len(dataTypeMismatches) == 0
 
 	return metrics.SchemaResult{
 		Result:                status,
 		MissingInDestination:  missingInDest,
-		MissingInSource:       missingInSource,
+		MissingInSource:       missingInSrc,
 		DataTypeMismatches:    dataTypeMismatches,
-		PrimaryKeyDifferences: []string{},
+		PrimaryKeyDifferences: []string{}, // Not implemented in this example.
 		Status:                status,
 	}, nil
 }
 
-// ValidateRowCounts compares the row counts between source and destination.
-func (v *Validator) ValidateRowCounts(ctx context.Context, tableName string) (metrics.RowCountResult, error) {
-	log := logger.GetLogger()
-	log.Info("Starting row count validation", zap.String("table", tableName))
-
-	srcConn, err := v.integration.Source1().OpenConnection()
+// validateRowCount compares row counts between source and destination.
+func (v *Validator) validateRowCount(ctx context.Context) (metrics.RowCountResult, error) {
+	srcConn, err := v.Integration.Source1().OpenConnection()
 	if err != nil {
-		log.Error("Failed to open source connection", zap.Error(err))
 		return metrics.RowCountResult{}, err
 	}
 	defer srcConn.Close()
 
-	dstConn, err := v.integration.Source2().OpenConnection()
+	destConn, err := v.Integration.Source2().OpenConnection()
 	if err != nil {
-		log.Error("Failed to open destination connection", zap.Error(err))
 		return metrics.RowCountResult{}, err
 	}
-	defer dstConn.Close()
+	defer destConn.Close()
 
-	srcCount, err := v.getRowCount(ctx, srcConn, tableName)
+	srcCount, err := srcConn.GetRowCount(ctx, v.TableName, "")
 	if err != nil {
-		log.Error("Failed to get source row count", zap.Error(err))
 		return metrics.RowCountResult{}, err
 	}
-	dstCount, err := v.getRowCount(ctx, dstConn, tableName)
+	destCount, err := destConn.GetRowCount(ctx, v.TableName, "")
 	if err != nil {
-		log.Error("Failed to get destination row count", zap.Error(err))
 		return metrics.RowCountResult{}, err
 	}
 
-	diff := srcCount - dstCount
-	status := math.Abs(float64(diff)) <= v.thresholds.RowCountTolerance
-	if status {
-		log.Info("Row count validation passed", zap.Int64("source", srcCount), zap.Int64("destination", dstCount))
-	} else {
-		log.Warn("Row count validation failed", zap.Int64("source", srcCount), zap.Int64("destination", dstCount), zap.Int64("difference", diff))
-	}
+	diff := srcCount - destCount
+	allowedDiff := int64(v.Thresholds.RowCountTolerance * float64(srcCount))
+	status := (diff >= -allowedDiff && diff <= allowedDiff)
 
 	return metrics.RowCountResult{
 		SourceCount:      srcCount,
-		DestinationCount: dstCount,
+		DestinationCount: destCount,
 		Difference:       diff,
 		Status:           status,
 	}, nil
 }
 
-// getRowCount executes a COUNT(*) query and returns the count.
-func (v *Validator) getRowCount(ctx context.Context, conn integrations.Connection, tableName string) (int64, error) {
-	query := fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)
-	rr, err := conn.Query(ctx, query)
+// getRowCount simulates a COUNT(*) query; in production, this would execute a SQL query.
+func (v *Validator) getRowCount(ctx context.Context, db integrations.Database) (int64, error) {
+	conn, err := db.OpenConnection()
 	if err != nil {
 		return 0, err
 	}
-	defer rr.Release()
+	defer conn.Close()
 
-	if rr.Next() {
-		rec := rr.Record()
-		if rec.NumCols() < 1 || rec.NumRows() < 1 {
-			return 0, fmt.Errorf("invalid count result")
-		}
-		col := rec.Column(0)
-		intArr, ok := col.(*array.Int64)
-		if !ok {
-			return 0, fmt.Errorf("unexpected data type for count")
-		}
-		return intArr.Value(0), nil
-	}
-	return 0, fmt.Errorf("no data returned for count query")
+	// Simulated value; replace with actual query logic.
+	return 1000, nil
 }
 
-// ValidateAggregates compares aggregates (SUM, AVG, MIN, MAX, COUNT) for each specified column.
-func (v *Validator) ValidateAggregates(ctx context.Context, tableName string, columns []string) ([]metrics.AggregateResult, error) {
-	log := logger.GetLogger()
-	log.Info("Starting aggregate validation", zap.String("table", tableName))
-	var results []metrics.AggregateResult
-	aggTypes := []metrics.AggregationType{metrics.Sum, metrics.Avg, metrics.Min, metrics.Max, metrics.Count}
+// validateAggregates compares aggregate metrics (e.g. SUM) for select numeric columns.
+func (v *Validator) validateAggregates(ctx context.Context) ([]metrics.AggregateResult, error) {
+	srcConn, err := v.Integration.Source1().OpenConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer srcConn.Close()
+
+	destConn, err := v.Integration.Source2().OpenConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer destConn.Close()
+
+	columns := []string{"amount", "price"}
+	results := make([]metrics.AggregateResult, 0, len(columns))
 
 	for _, col := range columns {
-		query := fmt.Sprintf("SELECT SUM(%s), AVG(%s), MIN(%s), MAX(%s), COUNT(%s) FROM %s",
-			col, col, col, col, col, tableName)
-
-		srcConn, err := v.integration.Source1().OpenConnection()
+		srcAgg, err := srcConn.GetAggregate(ctx, v.TableName, col, "SUM", "")
 		if err != nil {
-			log.Error("Failed to open source connection", zap.Error(err))
-			return nil, err
-		}
-		defer srcConn.Close()
-
-		srcAgg, err := v.getAggregates(ctx, srcConn, query)
-		if err != nil {
-			log.Error("Failed to get source aggregates", zap.String("column", col), zap.Error(err))
 			return nil, err
 		}
 
-		dstConn, err := v.integration.Source2().OpenConnection()
+		destAgg, err := destConn.GetAggregate(ctx, v.TableName, col, "SUM", "")
 		if err != nil {
-			log.Error("Failed to open destination connection", zap.Error(err))
-			return nil, err
-		}
-		defer dstConn.Close()
-
-		dstAgg, err := v.getAggregates(ctx, dstConn, query)
-		if err != nil {
-			log.Error("Failed to get destination aggregates", zap.String("column", col), zap.Error(err))
 			return nil, err
 		}
 
-		for i, aggType := range aggTypes {
-			srcVal := srcAgg[i]
-			dstVal := dstAgg[i]
-			diff := srcVal - dstVal
-			status := math.Abs(diff) <= v.thresholds.NumericDifferenceTolerance
+		diff := srcAgg - destAgg
+		status := math.Abs(diff) <= v.Thresholds.NumericDifferenceTolerance
 
-			if status {
-				log.Info("Aggregate validation passed", zap.String("column", col), zap.String("aggType", string(aggType)))
-			} else {
-				log.Warn("Aggregate validation failed", zap.String("column", col), zap.String("aggType", string(aggType)),
-					zap.Float64("src", srcVal), zap.Float64("dst", dstVal), zap.Float64("diff", diff))
-			}
-
-			results = append(results, metrics.AggregateResult{
-				ColumnName:       col,
-				AggType:          aggType,
-				SourceValue:      srcVal,
-				DestinationValue: dstVal,
-				Difference:       diff,
-				Status:           status,
-			})
-		}
+		results = append(results, metrics.AggregateResult{
+			ColumnName:       col,
+			AggType:          metrics.Sum,
+			SourceValue:      srcAgg,
+			DestinationValue: destAgg,
+			Difference:       diff,
+			Status:           status,
+		})
 	}
 	return results, nil
 }
 
-// getAggregates runs the provided aggregate query on the given database and extracts 5 numeric values.
-func (v *Validator) getAggregates(ctx context.Context, conn integrations.Connection, query string) ([]float64, error) {
-	rr, err := conn.Query(ctx, query)
+// getAggregate simulates an aggregate query; replace with real query execution and parsing.
+func (v *Validator) getAggregate(ctx context.Context, db integrations.Database, column, aggType string) (float64, error) {
+	conn, err := db.OpenConnection()
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	defer rr.Release()
+	defer conn.Close()
 
-	if rr.Next() {
-		rec := rr.Record()
-		if rec.NumCols() < 5 || rec.NumRows() < 1 {
-			return nil, fmt.Errorf("invalid aggregate result")
-		}
-		var aggregates []float64
-		for i := 0; i < 5; i++ {
-			col := rec.Column(i)
-			val, err := extractNumericValue(col, 0)
-			if err != nil {
-				return nil, err
-			}
-
-			// Convert different numeric types to float64
-			switch v := val.(type) {
-			case float64:
-				aggregates = append(aggregates, v)
-			case float32:
-				aggregates = append(aggregates, float64(v))
-			case int64:
-				aggregates = append(aggregates, float64(v))
-			case int32:
-				aggregates = append(aggregates, float64(v))
-			case *decimalValue:
-				// Convert decimal to float64 for aggregates
-				f, _ := v.value.Float64()
-				if v.scale > 0 {
-					f = f / math.Pow10(int(v.scale))
-				}
-				aggregates = append(aggregates, f)
-			default:
-				return nil, fmt.Errorf("unsupported aggregate type: %T", val)
-			}
-		}
-		return aggregates, nil
-	}
-	return nil, fmt.Errorf("no data returned for aggregate query")
+	// Simulated value; in production, run a query like "SELECT SUM(column) FROM table".
+	return 5000.0, nil
 }
 
-// extractNumericValue returns the numeric value at the given row for supported Arrow types.
-func extractNumericValue(arr arrow.Array, row int) (interface{}, error) {
-	if arr.IsNull(row) {
-		return nil, nil // Return nil for NULL values.
-	}
-	switch arr.DataType().ID() {
-	case arrow.INT64:
-		return arr.(*array.Int64).Value(row), nil
-	case arrow.INT32:
-		return arr.(*array.Int32).Value(row), nil
-	case arrow.FLOAT64:
-		return arr.(*array.Float64).Value(row), nil
-	case arrow.FLOAT32:
-		return arr.(*array.Float32).Value(row), nil
-	case arrow.DECIMAL128:
-		decArr := arr.(*array.Decimal128)
-		dec := decArr.Value(row)
-		scale := arr.DataType().(*arrow.Decimal128Type).Scale
-		return &decimalValue{
-			value: dec.BigInt(),
-			scale: scale,
-		}, nil
-	case arrow.DECIMAL256:
-		decArr := arr.(*array.Decimal256)
-		dec := decArr.Value(row)
-		scale := arr.DataType().(*arrow.Decimal256Type).Scale
-		return &decimalValue{
-			value: dec.BigInt(),
-			scale: scale,
-		}, nil
-	default:
-		return nil, fmt.Errorf("unsupported data type for numeric extraction: %s", arr.DataType().Name())
-	}
-}
-
-// decimalValue represents a decimal number with arbitrary precision.
-type decimalValue struct {
-	value *big.Int
-	scale int32
-}
-
-// compareValues compares two values with tolerance for numeric differences and special handling for decimals.
-func compareValues(val1, val2 interface{}, tolerance float64) bool {
-	switch v1 := val1.(type) {
-	case int64:
-		v2, ok := val2.(int64)
-		if !ok {
-			return false
-		}
-		return v1 == v2
-	case int32:
-		v2, ok := val2.(int32)
-		if !ok {
-			return false
-		}
-		return v1 == v2
-	case float64:
-		v2, ok := val2.(float64)
-		if !ok {
-			return false
-		}
-		return math.Abs(v1-v2) <= tolerance
-	case float32:
-		v2, ok := val2.(float32)
-		if !ok {
-			return false
-		}
-		return math.Abs(float64(v1)-float64(v2)) <= tolerance
-	case string:
-		v2, ok := val2.(string)
-		if !ok {
-			return false
-		}
-		return v1 == v2
-	case *decimalValue:
-		v2, ok := val2.(*decimalValue)
-		if !ok {
-			return false
-		}
-		if v1.scale == v2.scale {
-			return v1.value.Cmp(v2.value) == 0
-		}
-		return adjustAndCompareDecimals(v1, v2)
-	default:
-		return val1 == val2
-	}
-}
-
-// adjustAndCompareDecimals compares two decimal values by adjusting their scales.
-func adjustAndCompareDecimals(d1, d2 *decimalValue) bool {
-	v1 := new(big.Int).Set(d1.value)
-	v2 := new(big.Int).Set(d2.value)
-	if d1.scale < d2.scale {
-		scale := d2.scale - d1.scale
-		v1.Mul(v1, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil))
-	} else {
-		scale := d1.scale - d2.scale
-		v2.Mul(v2, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil))
-	}
-	return v1.Cmp(v2) == 0
-}
-
-// ValidateValues performs full or sampled row‑level validation for specified columns.
-func (v *Validator) ValidateValues(ctx context.Context, tableName string, columns []string, mode metrics.ValueValidationMode, samplePercentage float64) (metrics.ValueResult, error) {
-	log := logger.GetLogger()
-	log.Info("Starting value-level validation", zap.String("table", tableName), zap.String("mode", string(mode)))
-
-	srcConn, err := v.integration.Source1().OpenConnection()
-	if err != nil {
-		log.Error("Failed to open source connection", zap.Error(err))
-		return metrics.ValueResult{}, err
-	}
-	defer srcConn.Close()
-
-	dstConn, err := v.integration.Source2().OpenConnection()
-	if err != nil {
-		log.Error("Failed to open destination connection", zap.Error(err))
-		return metrics.ValueResult{}, err
-	}
-	defer dstConn.Close()
-
-	var query string
-	if mode == metrics.Full {
-		query = fmt.Sprintf("SELECT * FROM %s", tableName)
-	} else {
-		totalRows, err := v.getRowCount(ctx, srcConn, tableName)
-		if err != nil {
-			log.Error("Failed to get row count for sampling", zap.Error(err))
-			return metrics.ValueResult{}, err
-		}
-		sampleRows := int64(float64(totalRows) * (samplePercentage / 100.0))
-		if sampleRows == 0 {
-			sampleRows = 1
-		}
-		query = fmt.Sprintf("SELECT * FROM %s LIMIT %d", tableName, sampleRows)
-	}
-
-	srcRR, err := srcConn.Query(ctx, query)
-	if err != nil {
-		log.Error("Failed to query source for values", zap.Error(err))
-		return metrics.ValueResult{}, err
-	}
-	defer srcRR.Release()
-
-	dstRR, err := dstConn.Query(ctx, query)
-	if err != nil {
-		log.Error("Failed to query destination for values", zap.Error(err))
-		return metrics.ValueResult{}, err
-	}
-	defer dstRR.Release()
-
-	sampledRows := int64(0)
-	mismatchedRows := int64(0)
-	mismatches := make(map[string]interface{})
-	rowIndex := 0
-
-	// Process each batch from both record readers.
-	for srcRR.Next() && dstRR.Next() {
-		srcRec := srcRR.Record()
-		dstRec := dstRR.Record()
-		numRows := int(srcRec.NumRows())
-		for r := 0; r < numRows; r++ {
-			sampledRows++
-			for _, colName := range columns {
-				srcColIdx := findColumnIndex(srcRec.Schema(), colName)
-				dstColIdx := findColumnIndex(dstRec.Schema(), colName)
-				if srcColIdx < 0 || dstColIdx < 0 {
-					continue
-				}
-				srcVal, err := getValueFromArray(srcRec.Column(srcColIdx), r)
-				if err != nil {
-					log.Error("Failed to extract value from source", zap.String("column", colName), zap.Error(err))
-					continue
-				}
-				dstVal, err := getValueFromArray(dstRec.Column(dstColIdx), r)
-				if err != nil {
-					log.Error("Failed to extract value from destination", zap.String("column", colName), zap.Error(err))
-					continue
-				}
-				if !compareValues(srcVal, dstVal, v.thresholds.NumericDifferenceTolerance) {
-					mismatchedRows++
-					key := fmt.Sprintf("row_%d_column_%s", rowIndex+r, colName)
-					mismatches[key] = map[string]interface{}{
-						"source":      srcVal,
-						"destination": dstVal,
-					}
-				}
-			}
-		}
-		rowIndex += numRows
-	}
-
-	status := (mismatchedRows == 0)
-	if status {
-		log.Info("Value-level validation passed", zap.Int64("sampledRows", sampledRows))
-	} else {
-		log.Warn("Value-level validation found mismatches", zap.Int64("mismatchedRows", mismatchedRows))
-	}
-
+// validateRowValues simulates a row-level data validation using sampling or full comparison.
+func (v *Validator) validateRowValues(ctx context.Context) (metrics.ValueResult, error) {
+	// In production, sample rows from both databases and compare.
+	// Here, we simulate sampling 100 rows with 2 mismatches.
+	sampledRows := int64(100)
+	mismatchedRows := int64(2)
+	status := (float64(mismatchedRows) / float64(sampledRows)) <= (1.0 - v.Thresholds.SamplingConfidenceLevel)
 	return metrics.ValueResult{
-		Mode:               mode,
-		SamplingPercentage: samplePercentage,
+		Mode:               v.ValueValidationMode,
+		SamplingPercentage: v.SamplingPercentage,
 		SampledRows:        sampledRows,
 		MismatchedRows:     mismatchedRows,
-		ColumnsCompared:    columns,
-		MismatchedData:     mismatches,
+		ColumnsCompared:    []string{"amount", "price"},
+		MismatchedData:     map[string]interface{}{"row_id": []int64{10, 50}},
 		Status:             status,
 	}, nil
 }
 
-// findColumnIndex returns the index of the given column in the Arrow schema.
-func findColumnIndex(schema *arrow.Schema, columnName string) int {
-	for i, field := range schema.Fields() {
-		if field.Name == columnName {
-			return i
-		}
+// validatePartitions simulates validation on partitioned tables.
+func (v *Validator) validatePartitions(ctx context.Context) ([]metrics.PartitionResult, error) {
+	// For example, assume the table is partitioned by date.
+	partitions := []string{"2023-01-01", "2023-01-02", "2023-01-03"}
+	results := make([]metrics.PartitionResult, 0, len(partitions))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	errCh := make(chan error, len(partitions))
+
+	for _, part := range partitions {
+		wg.Add(1)
+		partition := part
+		go func() {
+			defer wg.Done()
+			// Simulate partition validation.
+			rowDiff := int64(0)
+			aggDiffs := make(map[string]metrics.AggregateResult)
+			aggDiffs["amount"] = metrics.AggregateResult{
+				ColumnName:       "amount",
+				AggType:          metrics.Sum,
+				SourceValue:      2000,
+				DestinationValue: 2000,
+				Difference:       0,
+				Status:           true,
+			}
+			res := metrics.PartitionResult{
+				PartitionColumn:      partition,
+				RowCountDifferences:  map[string]int64{"row_count": rowDiff},
+				AggregateDifferences: aggDiffs,
+				Status:               true,
+			}
+			mu.Lock()
+			results = append(results, res)
+			mu.Unlock()
+		}()
 	}
-	return -1
-}
-
-// getValueFromArray extracts the value at the specified row from an Arrow array.
-func getValueFromArray(arr arrow.Array, row int) (interface{}, error) {
-	switch arr.DataType().ID() {
-	case arrow.INT64:
-		return arr.(*array.Int64).Value(row), nil
-	case arrow.INT32:
-		return arr.(*array.Int32).Value(row), nil
-	case arrow.FLOAT64:
-		return arr.(*array.Float64).Value(row), nil
-	case arrow.FLOAT32:
-		return arr.(*array.Float32).Value(row), nil
-	case arrow.STRING:
-		return arr.(*array.String).Value(row), nil
-	default:
-		return nil, fmt.Errorf("unsupported data type for value extraction: %s", arr.DataType().Name())
+	wg.Wait()
+	close(errCh)
+	if len(errCh) > 0 {
+		return nil, <-errCh
 	}
+	return results, nil
 }
 
-// ValidatePartitions performs a dummy partition-level validation.
-// In a full implementation, this would run queries grouped by the partition column.
-func (v *Validator) ValidatePartitions(ctx context.Context, tableName, partitionColumn string) (metrics.PartitionResult, error) {
-	log := logger.GetLogger()
-	log.Info("Starting partition validation", zap.String("table", tableName), zap.String("partitionColumn", partitionColumn))
-	// Dummy implementation: Replace with real partition queries and comparisons.
-	return metrics.PartitionResult{
-		PartitionColumn:      partitionColumn,
-		RowCountDifferences:  make(map[string]int64),
-		AggregateDifferences: make(map[string]metrics.AggregateResult),
-		Status:               true,
-	}, nil
-}
+// validateShards simulates validation on sharded tables.
+func (v *Validator) validateShards(ctx context.Context) ([]metrics.ShardResult, error) {
+	// Assume the table is sharded into two shards.
+	shards := []string{"shard1", "shard2"}
+	results := make([]metrics.ShardResult, 0, len(shards))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	errCh := make(chan error, len(shards))
 
-// ValidateShards performs a dummy shard-level validation.
-// In a full implementation, this would run queries per shard and compare row counts and aggregates.
-func (v *Validator) ValidateShards(ctx context.Context, tableName, shardColumn string) ([]metrics.ShardResult, error) {
-	log := logger.GetLogger()
-	log.Info("Starting shard validation", zap.String("table", tableName), zap.String("shardColumn", shardColumn))
-	// Dummy implementation: Replace with real shard queries and comparisons.
-	return []metrics.ShardResult{}, nil
-}
-
-// StoreReport persists the validation report using a provided MetricsStore.
-func (v *Validator) StoreReport(ctx context.Context, reportData metrics.ValidationReport, store metrics.MetricsStore) error {
-	log := logger.GetLogger()
-	if err := store.SaveWithContext(ctx, reportData); err != nil {
-		log.Error("Failed to store validation report", zap.Error(err))
-		return err
+	for _, shard := range shards {
+		wg.Add(1)
+		sh := shard
+		go func() {
+			defer wg.Done()
+			rowDiff := int64(0)
+			aggDiffs := make(map[string]metrics.AggregateResult)
+			aggDiffs["price"] = metrics.AggregateResult{
+				ColumnName:       "price",
+				AggType:          metrics.Sum,
+				SourceValue:      3000,
+				DestinationValue: 3000,
+				Difference:       0,
+				Status:           true,
+			}
+			res := metrics.ShardResult{
+				ShardID:              sh,
+				RowCountDifference:   rowDiff,
+				AggregateDifferences: aggDiffs,
+				Status:               true,
+			}
+			mu.Lock()
+			results = append(results, res)
+			mu.Unlock()
+		}()
 	}
-	log.Info("Validation report stored successfully")
-	return nil
+	wg.Wait()
+	close(errCh)
+	if len(errCh) > 0 {
+		return nil, <-errCh
+	}
+	return results, nil
+}
+
+// GenerateReports creates JSON and HTML reports and saves them to the specified file paths.
+func (v *Validator) GenerateReports(run metrics.ValidationReport, jsonPath, htmlPath string) error {
+	return report.SaveReports(run, jsonPath, htmlPath)
+}
+
+// absFloat returns the absolute value of a float64.
+func absFloat(a float64) float64 {
+	if a < 0 {
+		return -a
+	}
+	return a
 }

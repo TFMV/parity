@@ -26,3 +26,4 @@ go.work.sum
 data/
 validation/parity.log
 .DS_Store
+parity.log
