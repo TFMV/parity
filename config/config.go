@@ -39,9 +39,15 @@ type DBConfig struct {
 	Tables   []TableConfig `yaml:"tables"`
 }
 
+type ServerConfig struct {
+	Port    string `yaml:"port"`
+	Prefork bool   `yaml:"prefork"`
+}
+
 type Config struct {
-	DB1 DBConfig `yaml:"DB1"`
-	DB2 DBConfig `yaml:"DB2"`
+	DB1    DBConfig     `yaml:"DB1"`
+	DB2    DBConfig     `yaml:"DB2"`
+	Server ServerConfig `yaml:"server"`
 }
 
 // --- Load Configuration ---

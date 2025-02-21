@@ -39,6 +39,15 @@ func init() {
 	// Define flags and configuration settings.
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is ./config.yaml)")
 
+	// Add help command
+	rootCmd.SetHelpCommand(&cobra.Command{
+		Use:   "help",
+		Short: "Display help for any command",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return rootCmd.Help()
+		},
+	})
+
 	// Subcommands
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(startCmd)
@@ -46,28 +55,34 @@ func init() {
 	rootCmd.AddCommand(runCmd)
 }
 
+// appConfig is the application configuration.
+var appConfig config.Config
+
 // initConfig reads in config file and ENV variables if set.
 func initConfig() {
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
-	viper.AddConfigPath(".") // search in current directory
+	viper.AddConfigPath(".") // Search in current directory
 
 	if cfgFile != "" {
-		// Use config file specified by the user.
 		viper.SetConfigFile(cfgFile)
 	}
 
-	viper.AutomaticEnv() // read in environment variables that match
+	viper.AutomaticEnv() // Read environment variables
 
-	// If a config file is found, read it in.
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			log.Println("No config file found. Using defaults and/or environment variables.")
+			log.Println("No config file found. Using defaults and environment variables.")
 		} else {
-			log.Printf("Error reading config file: %v", err) // Potentially fatal? Depends on defaults
+			log.Printf("Error reading config file: %v", err)
 		}
 	} else {
 		log.Printf("Using config file: %s", viper.ConfigFileUsed())
+	}
+
+	// Unmarshal config into struct
+	if err := viper.Unmarshal(&appConfig); err != nil {
+		log.Fatalf("Failed to parse configuration: %v", err)
 	}
 }
 
@@ -93,41 +108,48 @@ var startCmd = &cobra.Command{
 	RunE:  startServer,
 }
 
+// startServer starts the Parity API server.
 func startServer(cmd *cobra.Command, args []string) error {
 	opts := api.ServerOptions{
-		Port:    viper.GetString("server.port"),
-		Prefork: viper.GetBool("server.prefork"),
+		Port:    appConfig.Server.Port,
+		Prefork: appConfig.Server.Prefork,
 	}
 
 	server := api.NewServer(opts)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
-	// Handle graceful shutdown
+	// Handle shutdown signals
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
 		<-quit
 		log.Println("Received shutdown signal, stopping server...")
-		cancel() // Signal the server to shutdown
+		cancel()
 	}()
 
-	// Start the server in a goroutine
+	// Start server in goroutine
+	serverErr := make(chan error, 1)
 	go func() {
 		if err := server.Start(); err != nil && !errors.Is(err, context.Canceled) {
-			log.Fatalf("Failed to start server: %v", err)
+			serverErr <- fmt.Errorf("server failed to start: %w", err)
 		}
 	}()
 
-	// Block until context is cancelled
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+		log.Println("Shutting down server...")
+	case err := <-serverErr:
+		log.Printf("Server error: %v", err)
+		cancel()
+		return err
+	}
 
-	log.Println("Shutting down server...")
+	// Graceful shutdown with timeout
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 
-	if err := server.Shutdown(shutdownCtx); err != nil && !errors.Is(err, context.Canceled) {
+	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Error during shutdown: %v", err)
 		return err
 	}
@@ -143,15 +165,16 @@ var validateConfigCmd = &cobra.Command{
 	RunE:  validateConfig,
 }
 
+// validateConfig validates the configuration file.
 func validateConfig(cmd *cobra.Command, args []string) error {
 	var cfg config.Config
 	if err := viper.Unmarshal(&cfg); err != nil {
-		return fmt.Errorf("failed to unmarshal config: %w", err)
+		return fmt.Errorf("failed to parse config: %w", err)
 	}
 	if err := config.ValidateConfig(&cfg); err != nil {
-		return fmt.Errorf("config validation failed: %w", err)
+		return fmt.Errorf("configuration validation failed: %w", err)
 	}
-	fmt.Println("Configuration is valid.")
+	log.Println("Configuration is valid.")
 	return nil
 }
 
@@ -167,8 +190,26 @@ func runValidation(cmd *cobra.Command, args []string) error {
 	w := spinner.New(spinner.CharSets[9], 100*time.Millisecond)
 	w.Suffix = " Running data validation..."
 	w.Start()
-	time.Sleep(3 * time.Second)
-	w.Stop()
-	fmt.Println("\nData validation completed.")
+
+	done := make(chan bool)
+
+	go func() {
+		// Simulate actual work being done
+		for range [5]int{} {
+			time.Sleep(800 * time.Millisecond) // Simulated progress
+		}
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		w.Stop()
+		log.Println("\nData validation completed successfully.")
+	case <-time.After(10 * time.Second): // Timeout safeguard
+		w.Stop()
+		log.Println("\nData validation took too long. Please check logs for details.")
+		return errors.New("validation timeout")
+	}
+
 	return nil
 }

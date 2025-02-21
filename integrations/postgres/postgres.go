@@ -227,3 +227,108 @@ func newWrappedRecordReader(rr array.RecordReader, stmt adbc.Statement) array.Re
 		stmt: stmt,
 	}
 }
+
+// GetPartitionWhereClause generates the WHERE clause for partitioned tables in PostgreSQL.
+// GetPartitionWhereClause generates the WHERE clause for partitioned tables in PostgreSQL.
+func (c *pgConn) GetPartitionWhereClause(ctx context.Context, table string, partition string) (string, error) {
+	if partition == "" {
+		return "", nil // No partition filtering needed
+	}
+
+	// Query the partition key from PostgreSQL system catalogs
+	partitionKey, err := c.detectPartitionKeyFromDB(ctx, table)
+	if err != nil {
+		return "", fmt.Errorf("failed to determine partition key: %w", err)
+	}
+
+	return fmt.Sprintf("WHERE %s = '%s'", partitionKey, partition), nil
+}
+
+// GetRowCount retrieves the row count for a given table (or partition).
+func (c *pgConn) GetRowCount(ctx context.Context, table string, partition string) (int64, error) {
+	whereClause, err := c.GetPartitionWhereClause(ctx, table, partition)
+	if err != nil {
+		return 0, err
+	}
+
+	query := fmt.Sprintf("SELECT COUNT(*) FROM %s %s", table, whereClause)
+
+	rr, err := c.Query(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+	defer rr.Release()
+
+	if rr.Next() {
+		rec := rr.Record()
+		if rec.NumCols() < 1 || rec.NumRows() < 1 {
+			return 0, fmt.Errorf("invalid row count result")
+		}
+
+		// Extract count value
+		return rec.Column(0).(*array.Int64).Value(0), nil
+	}
+	return 0, fmt.Errorf("no rows returned for COUNT query")
+}
+
+// GetAggregate computes an aggregate function on a column.
+func (c *pgConn) GetAggregate(ctx context.Context, table, column, function, partition string) (float64, error) {
+	whereClause, err := c.GetPartitionWhereClause(ctx, table, partition)
+	if err != nil {
+		return 0, err
+	}
+
+	query := fmt.Sprintf("SELECT %s(%s) FROM %s %s", function, column, table, whereClause)
+
+	rr, err := c.Query(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+	defer rr.Release()
+
+	if rr.Next() {
+		rec := rr.Record()
+		if rec.NumCols() < 1 || rec.NumRows() < 1 {
+			return 0, fmt.Errorf("invalid aggregate result")
+		}
+
+		// Convert result to float
+		switch v := rec.Column(0).(*array.Float64); {
+		case v != nil:
+			return v.Value(0), nil
+		default:
+			return 0, fmt.Errorf("unexpected data type in aggregate result")
+		}
+	}
+
+	return 0, fmt.Errorf("no rows returned for aggregate query")
+}
+
+// detectPartitionKeyFromDB queries PostgreSQL to determine the partition key.
+func (c *pgConn) detectPartitionKeyFromDB(ctx context.Context, table string) (string, error) {
+	query := `
+		SELECT a.attname 
+		FROM pg_partitioned_table pt
+		JOIN pg_class c ON pt.partrelid = c.oid
+		JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(pt.partattrs)
+		WHERE c.relname = $1;
+	`
+
+	rr, err := c.Query(ctx, query)
+	if err != nil {
+		return "", fmt.Errorf("failed to retrieve partition key: %w", err)
+	}
+	defer rr.Release()
+
+	if rr.Next() {
+		rec := rr.Record()
+		if rec.NumCols() < 1 || rec.NumRows() < 1 {
+			return "", fmt.Errorf("partition key not found for table '%s'", table)
+		}
+
+		// Extract partition key
+		return rec.Column(0).(*array.String).Value(0), nil
+	}
+
+	return "", fmt.Errorf("no partition key detected for table '%s'", table)
+}

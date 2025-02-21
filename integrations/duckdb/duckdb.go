@@ -274,3 +274,103 @@ func newWrappedRecordReader(rr array.RecordReader, stmt adbc.Statement) array.Re
 		stmt: stmt,
 	}
 }
+
+// GetPartitionWhereClause generates a WHERE clause for partitioned tables in DuckDB.
+func (c *duckConn) GetPartitionWhereClause(ctx context.Context, table string, partition string) (string, error) {
+	if partition == "" {
+		return "", nil // No partition filtering needed
+	}
+
+	// Retrieve schema to find partition key
+	schema, err := c.GetTableSchema(ctx, nil, nil, table)
+	if err != nil {
+		return "", fmt.Errorf("failed to retrieve schema for partition detection: %w", err)
+	}
+
+	partitionKey := detectPartitionKey(schema)
+	if partitionKey == "" {
+		return "", fmt.Errorf("no partition key found for table '%s'", table)
+	}
+
+	return fmt.Sprintf("WHERE %s = '%s'", partitionKey, partition), nil
+}
+
+// GetRowCount retrieves the row count for a given table (or partition).
+func (c *duckConn) GetRowCount(ctx context.Context, table string, partition string) (int64, error) {
+	whereClause, err := c.GetPartitionWhereClause(ctx, table, partition)
+	if err != nil {
+		return 0, err
+	}
+
+	query := fmt.Sprintf("SELECT COUNT(*) FROM %s %s", table, whereClause)
+
+	rr, err := c.Query(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+	defer rr.Release()
+
+	if rr.Next() {
+		rec := rr.Record()
+		if rec.NumCols() < 1 || rec.NumRows() < 1 {
+			return 0, fmt.Errorf("invalid row count result")
+		}
+
+		// Extract row count value
+		return rec.Column(0).(*array.Int64).Value(0), nil
+	}
+	return 0, fmt.Errorf("no rows returned for COUNT query")
+}
+
+// GetAggregate computes an aggregate function (SUM, AVG, etc.) on a column.
+func (c *duckConn) GetAggregate(ctx context.Context, table, column, function, partition string) (float64, error) {
+	whereClause, err := c.GetPartitionWhereClause(ctx, table, partition)
+	if err != nil {
+		return 0, err
+	}
+
+	query := fmt.Sprintf("SELECT %s(%s) FROM %s %s", function, column, table, whereClause)
+
+	rr, err := c.Query(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+	defer rr.Release()
+
+	if rr.Next() {
+		rec := rr.Record()
+		if rec.NumCols() < 1 || rec.NumRows() < 1 {
+			return 0, fmt.Errorf("invalid aggregate result")
+		}
+
+		// Convert result to float
+		switch v := rec.Column(0).(*array.Float64); {
+		case v != nil:
+			return v.Value(0), nil
+		default:
+			return 0, fmt.Errorf("unexpected data type in aggregate result")
+		}
+	}
+
+	return 0, fmt.Errorf("no rows returned for aggregate query")
+}
+
+// detectPartitionKey inspects the schema to determine the likely partition key.
+func detectPartitionKey(schema *arrow.Schema) string {
+	for _, field := range schema.Fields() {
+		if isLikelyPartitionKey(field) {
+			return field.Name
+		}
+	}
+	return ""
+}
+
+// isLikelyPartitionKey determines if a column is a suitable partition key.
+func isLikelyPartitionKey(field arrow.Field) bool {
+	switch field.Type.ID() {
+	case arrow.INT32, arrow.INT64, arrow.DATE32, arrow.DATE64, arrow.TIMESTAMP, arrow.STRING:
+		return true
+	default:
+		return false
+	}
+}

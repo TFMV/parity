@@ -198,6 +198,13 @@ func (h *HTMLReportGenerator) SaveReportToFile(run metrics.ValidationReport, fil
 	return os.WriteFile(filePath, data, 0644)
 }
 
+// ReportFromFilePath loads and generates a report from a file
+func (h *HTMLReportGenerator) ReportFromFilePath(path string) (metrics.ValidationReport, error) {
+	// For HTML generator, delegate to JSON parser since we store data in JSON format
+	jsonGen := &JSONReportGenerator{}
+	return jsonGen.ReportFromFilePath(path)
+}
+
 // SaveReports saves both JSON and HTML reports.
 func SaveReports(run metrics.ValidationReport, jsonPath, htmlPath string) error {
 	jsonGen := JSONReportGenerator{}

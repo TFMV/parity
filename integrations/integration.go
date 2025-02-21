@@ -54,10 +54,22 @@ type Database interface {
 type Connection interface {
 	// Exec executes a query that doesn't return results
 	Exec(ctx context.Context, sql string) (int64, error)
+
 	// Query executes a query and returns results
 	Query(ctx context.Context, sql string) (array.RecordReader, error)
+
 	// GetTableSchema returns the schema for a table
 	GetTableSchema(ctx context.Context, catalog, schema *string, table string) (*arrow.Schema, error)
+
+	// GetPartitionWhereClause returns the appropriate WHERE clause for querying a partitioned table.
+	GetPartitionWhereClause(ctx context.Context, table string, partition string) (string, error)
+
+	// GetRowCount returns the row count of a table (or partition).
+	GetRowCount(ctx context.Context, table string, partition string) (int64, error)
+
+	// GetAggregate executes an aggregate query (SUM, AVG, etc.) for a given column.
+	GetAggregate(ctx context.Context, table, column, function, partition string) (float64, error)
+
 	// Close closes the connection
 	Close()
 }
