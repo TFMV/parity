@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -84,6 +85,6 @@ func TestShutdown(t *testing.T) {
 		Prefork: false,
 	}
 	s := api.NewServer(opts)
-	err := s.Shutdown()
+	err := s.Shutdown(context.Background())
 	assert.NoError(t, err, "Expected no error calling Shutdown on server")
 }

@@ -6,45 +6,45 @@ import (
 	"github.com/spf13/viper"
 )
 
-type DatabaseConfig struct {
-	Type     string        `mapstructure:"type"`
-	Host     string        `mapstructure:"host"`
-	Port     int           `mapstructure:"port"`
-	User     string        `mapstructure:"user"`
-	Password string        `mapstructure:"password"`
-	DBName   string        `mapstructure:"dbname"`
-	Path     string        `mapstructure:"path"`
-	Tables   []TableConfig `mapstructure:"tables"`
-}
-
-type TableConfig struct {
-	Name         string              `mapstructure:"name"`
-	PrimaryKey   string              `mapstructure:"primary_key"`
-	Sharding     *ShardingConfig     `mapstructure:"sharding"`
-	Partitioning *PartitioningConfig `mapstructure:"partitioning"`
-	Sampling     *SamplingConfig     `mapstructure:"sampling"`
-}
+// --- Configuration Structs ---
 
 type ShardingConfig struct {
-	Key      string `mapstructure:"key"`
-	Strategy string `mapstructure:"strategy"`
+	Key      string `yaml:"key"`
+	Strategy string `yaml:"strategy"`
 }
 
 type PartitioningConfig struct {
-	Key  string `mapstructure:"key"`
-	Type string `mapstructure:"type"`
+	Key  string `yaml:"key"`
+	Type string `yaml:"type"`
 }
 
-type SamplingConfig struct {
-	Enabled      bool    `mapstructure:"enabled"`
-	SampleRate   float64 `mapstructure:"sample_rate"`
-	SampleColumn string  `mapstructure:"sample_column"`
+type TableConfig struct {
+	Name         string              `yaml:"name"`
+	PrimaryKey   string              `yaml:"primary_key"`
+	Sharding     *ShardingConfig     `yaml:"sharding,omitempty"`
+	Partitioning *PartitioningConfig `yaml:"partitioning,omitempty"`
+	Sampling     bool                `yaml:"sampling"`
+	SampleRate   float64             `yaml:"sample_rate"`
+	SampleColumn string              `yaml:"sample_column"`
+}
+
+type DBConfig struct {
+	Type     string        `yaml:"type"`
+	Host     string        `yaml:"host,omitempty"`
+	Port     int           `yaml:"port,omitempty"`
+	User     string        `yaml:"user,omitempty"`
+	Password string        `yaml:"password,omitempty"`
+	DBName   string        `yaml:"dbname,omitempty"`
+	Path     string        `yaml:"path,omitempty"` //For SQLite
+	Tables   []TableConfig `yaml:"tables"`
 }
 
 type Config struct {
-	DB1 DatabaseConfig `mapstructure:"DB1"`
-	DB2 DatabaseConfig `mapstructure:"DB2"`
+	DB1 DBConfig `yaml:"DB1"`
+	DB2 DBConfig `yaml:"DB2"`
 }
+
+// --- Load Configuration ---
 
 func LoadConfig(configPath string) (*Config, error) {
 	viper.SetConfigFile(configPath)
@@ -62,76 +62,79 @@ func LoadConfig(configPath string) (*Config, error) {
 	return &cfg, nil
 }
 
-func ValidateConfig(cfg *Config) error {
-	if cfg.DB1.Type == "" {
-		return fmt.Errorf("DB1 type is required")
+// --- Validation Functions ---
+
+// validate is a helper function to reduce repetition.
+func validate(condition bool, format string, a ...any) error {
+	if !condition {
+		return fmt.Errorf(format, a...)
 	}
-	if cfg.DB2.Type == "" {
-		return fmt.Errorf("DB2 type is required")
+	return nil
+}
+
+func (c *Config) Validate() error { // Method on Config
+	if err := c.DB1.Validate(); err != nil {
+		return fmt.Errorf("DB1 validation failed: %w", err)
 	}
-	for _, table := range cfg.DB1.Tables {
-		if err := ValidateTableConfig(&table); err != nil {
-			return err
+	if err := c.DB2.Validate(); err != nil {
+		return fmt.Errorf("DB2 validation failed: %w", err)
+	}
+	return nil
+}
+func (dbc *DBConfig) Validate() error {
+	if err := validate(dbc.Type != "", "DB type is required"); err != nil {
+		return err
+	}
+	for i, table := range dbc.Tables {
+		if err := table.Validate(); err != nil {
+			return fmt.Errorf("table '%s' validation failed: %w", dbc.Tables[i].Name, err)
 		}
 	}
-	for _, table := range cfg.DB2.Tables {
-		if err := ValidateTableConfig(&table); err != nil {
+	return nil
+}
+
+func (tc *TableConfig) Validate() error {
+	if err := validate(tc.Name != "", "table name is required"); err != nil {
+		return err
+	}
+	if err := validate(tc.PrimaryKey != "", "primary key is required"); err != nil {
+		return err
+	}
+
+	if tc.Sharding != nil {
+		if err := tc.Sharding.Validate(); err != nil {
+			return fmt.Errorf("sharding configuration error: %w", err)
+		}
+	}
+	if tc.Partitioning != nil {
+		if err := tc.Partitioning.Validate(); err != nil {
+			return fmt.Errorf("partitioning configuration error: %w", err)
+		}
+	}
+	if tc.Sampling {
+		if err := validate(tc.SampleRate > 0 && tc.SampleRate <= 1, "sample rate must be between 0 and 1"); err != nil {
+			return err
+		}
+		if err := validate(tc.SampleColumn != "", "sample column is required when sampling is enabled"); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func ValidateTableConfig(cfg *TableConfig) error {
-	if cfg.Name == "" {
-		return fmt.Errorf("table name is required")
-	}
-	if cfg.PrimaryKey == "" {
-		return fmt.Errorf("primary key is required")
-	}
-	if cfg.Sharding != nil {
-		if err := ValidateShardingConfig(cfg.Sharding); err != nil {
-			return err
-		}
-	}
-	if cfg.Partitioning != nil {
-		if err := ValidatePartitioningConfig(cfg.Partitioning); err != nil {
-			return err
-		}
-	}
-	if cfg.Sampling != nil {
-		if err := ValidateSamplingConfig(cfg.Sampling); err != nil {
-			return err
-		}
-	}
-	return nil
+func (sc *ShardingConfig) Validate() error {
+	return validate(sc.Key != "", "sharding key is required")
 }
 
-func ValidateShardingConfig(cfg *ShardingConfig) error {
-	if cfg.Key == "" {
-		return fmt.Errorf("sharding key is required")
+func (pc *PartitioningConfig) Validate() error {
+	if err := validate(pc.Key != "", "partitioning key is required"); err != nil {
+		return err
 	}
-	return nil
+	return validate(pc.Type != "", "partitioning type is required")
 }
 
-func ValidatePartitioningConfig(cfg *PartitioningConfig) error {
-	if cfg.Key == "" {
-		return fmt.Errorf("partitioning key is required")
-	}
-	if cfg.Type == "" {
-		return fmt.Errorf("partitioning type is required")
-	}
-	return nil
-}
+// --- Top-Level Validation ---  (Optional, but good practice)
 
-func ValidateSamplingConfig(cfg *SamplingConfig) error {
-	if cfg.Enabled {
-		if cfg.SampleRate <= 0 || cfg.SampleRate > 1 {
-			return fmt.Errorf("sample rate must be between 0 and 1")
-		}
-		if cfg.SampleColumn == "" {
-			return fmt.Errorf("sample column is required")
-		}
-	}
-	return nil
+func ValidateConfig(cfg *Config) error { //Kept for backward compatibility since it is exported.
+	return cfg.Validate()
 }

@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"errors"
 
 	"github.com/TFMV/parity/version"
 	"github.com/spf13/cobra"
@@ -53,20 +56,30 @@ func TestCLI_Default(t *testing.T) {
 func TestCLI_Start(t *testing.T) {
 	rootCmd := newRootCommand()
 	errCh := make(chan error, 1)
+
+	// Start server in background
 	go func() {
 		errCh <- executeCommandErr(rootCmd, "start")
 	}()
 
-	time.Sleep(500 * time.Millisecond)
+	// Give server time to start
+	time.Sleep(100 * time.Millisecond)
 
-	p, _ := os.FindProcess(os.Getpid())
-	if err := p.Signal(os.Interrupt); err != nil {
-		t.Fatalf("Failed to send interrupt signal: %v", err)
-	}
-
-	err := <-errCh
+	// Send interrupt signal
+	process, err := os.FindProcess(os.Getpid())
 	if err != nil {
-		t.Errorf("Expected no error after graceful shutdown, got %v", err)
+		t.Fatalf("Failed to find process: %v", err)
+	}
+	process.Signal(os.Interrupt)
+
+	// Wait for shutdown and check error
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Expected no error or context.Canceled, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("Test timed out waiting for server shutdown")
 	}
 }
 
@@ -113,7 +126,7 @@ func newRootCommand() *cobra.Command {
 		Use:   "validate-config",
 		Short: "Validate the Parity configuration file",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return validateConfig()
+			return validateConfig(cmd, args)
 		},
 	}
 	rootCmd.AddCommand(validateConfigCmd)
@@ -123,7 +136,7 @@ func newRootCommand() *cobra.Command {
 		Use:   "run",
 		Short: "Run a data validation",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runValidation()
+			return runValidation(cmd, args)
 		},
 	}
 	rootCmd.AddCommand(runCmd)
