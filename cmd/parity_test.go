@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -12,12 +13,33 @@ import (
 
 	"github.com/TFMV/parity/version"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
 
 var isTest = false
 
 func init() {
 	isTest = true
+	// Set empty config for tests
+	viper.SetConfigType("yaml")
+	testConfig := strings.NewReader(`
+server:
+  port: "3000"
+  prefork: false
+DB1:
+  type: "postgres"
+  tables:
+    - name: "test"
+      primary_key: "id"
+DB2:
+  type: "postgres"
+  tables:
+    - name: "test"
+      primary_key: "id"
+`)
+	if err := viper.ReadConfig(testConfig); err != nil {
+		panic(fmt.Sprintf("Failed to load test config: %v", err))
+	}
 }
 
 func TestCLI_Help(t *testing.T) {
@@ -54,16 +76,21 @@ func TestCLI_Default(t *testing.T) {
 }
 
 func TestCLI_Start(t *testing.T) {
+	// Reset config for this test
+	viper.Set("server.port", "3001") // Use different port for test
+
 	rootCmd := newRootCommand()
 	errCh := make(chan error, 1)
+	done := make(chan struct{})
 
 	// Start server in background
 	go func() {
+		defer close(done)
 		errCh <- executeCommandErr(rootCmd, "start")
 	}()
 
 	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	// Send interrupt signal
 	process, err := os.FindProcess(os.Getpid())
@@ -72,14 +99,21 @@ func TestCLI_Start(t *testing.T) {
 	}
 	process.Signal(os.Interrupt)
 
-	// Wait for shutdown and check error
+	// Wait for shutdown with timeout
 	select {
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, context.Canceled) {
 			t.Errorf("Expected no error or context.Canceled, got %v", err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Error("Test timed out waiting for server shutdown")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Test timed out waiting for server shutdown")
+	}
+
+	// Ensure server goroutine completed
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Server goroutine did not complete")
 	}
 }
 

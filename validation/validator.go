@@ -107,7 +107,7 @@ func (v *Validator) Validate(ctx context.Context) (metrics.ValidationReport, err
 
 	go func() {
 		defer wg.Done()
-		res, err := v.validateRowValues(ctx)
+		res, err := v.validateRowValues()
 		if err != nil {
 			errCh <- fmt.Errorf("row values validation failed: %w", err)
 			return
@@ -130,11 +130,11 @@ func (v *Validator) Validate(ctx context.Context) (metrics.ValidationReport, err
 	}
 
 	// Validate partitions and shards sequentially (or concurrently if needed).
-	partitionMetrics, err := v.validatePartitions(ctx)
+	partitionMetrics, err := v.validatePartitions()
 	if err != nil {
 		v.Logger.Error("Partition validation failed", zap.Error(err))
 	}
-	shardMetrics, err := v.validateShards(ctx)
+	shardMetrics, err := v.validateShards()
 	if err != nil {
 		v.Logger.Error("Shard validation failed", zap.Error(err))
 	}
@@ -283,18 +283,6 @@ func (v *Validator) validateRowCount(ctx context.Context) (metrics.RowCountResul
 	}, nil
 }
 
-// getRowCount simulates a COUNT(*) query; in production, this would execute a SQL query.
-func (v *Validator) getRowCount(ctx context.Context, db integrations.Database) (int64, error) {
-	conn, err := db.OpenConnection()
-	if err != nil {
-		return 0, err
-	}
-	defer conn.Close()
-
-	// Simulated value; replace with actual query logic.
-	return 1000, nil
-}
-
 // validateAggregates compares aggregate metrics (e.g. SUM) for select numeric columns.
 func (v *Validator) validateAggregates(ctx context.Context) ([]metrics.AggregateResult, error) {
 	srcConn, err := v.Integration.Source1().OpenConnection()
@@ -338,20 +326,8 @@ func (v *Validator) validateAggregates(ctx context.Context) ([]metrics.Aggregate
 	return results, nil
 }
 
-// getAggregate simulates an aggregate query; replace with real query execution and parsing.
-func (v *Validator) getAggregate(ctx context.Context, db integrations.Database, column, aggType string) (float64, error) {
-	conn, err := db.OpenConnection()
-	if err != nil {
-		return 0, err
-	}
-	defer conn.Close()
-
-	// Simulated value; in production, run a query like "SELECT SUM(column) FROM table".
-	return 5000.0, nil
-}
-
 // validateRowValues simulates a row-level data validation using sampling or full comparison.
-func (v *Validator) validateRowValues(ctx context.Context) (metrics.ValueResult, error) {
+func (v *Validator) validateRowValues() (metrics.ValueResult, error) {
 	// In production, sample rows from both databases and compare.
 	// Here, we simulate sampling 100 rows with 2 mismatches.
 	sampledRows := int64(100)
@@ -369,7 +345,7 @@ func (v *Validator) validateRowValues(ctx context.Context) (metrics.ValueResult,
 }
 
 // validatePartitions simulates validation on partitioned tables.
-func (v *Validator) validatePartitions(ctx context.Context) ([]metrics.PartitionResult, error) {
+func (v *Validator) validatePartitions() ([]metrics.PartitionResult, error) {
 	// For example, assume the table is partitioned by date.
 	partitions := []string{"2023-01-01", "2023-01-02", "2023-01-03"}
 	results := make([]metrics.PartitionResult, 0, len(partitions))
@@ -413,7 +389,7 @@ func (v *Validator) validatePartitions(ctx context.Context) ([]metrics.Partition
 }
 
 // validateShards simulates validation on sharded tables.
-func (v *Validator) validateShards(ctx context.Context) ([]metrics.ShardResult, error) {
+func (v *Validator) validateShards() ([]metrics.ShardResult, error) {
 	// Assume the table is sharded into two shards.
 	shards := []string{"shard1", "shard2"}
 	results := make([]metrics.ShardResult, 0, len(shards))
@@ -458,12 +434,4 @@ func (v *Validator) validateShards(ctx context.Context) ([]metrics.ShardResult, 
 // GenerateReports creates JSON and HTML reports and saves them to the specified file paths.
 func (v *Validator) GenerateReports(run metrics.ValidationReport, jsonPath, htmlPath string) error {
 	return report.SaveReports(run, jsonPath, htmlPath)
-}
-
-// absFloat returns the absolute value of a float64.
-func absFloat(a float64) float64 {
-	if a < 0 {
-		return -a
-	}
-	return a
 }
