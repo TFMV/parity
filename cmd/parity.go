@@ -60,6 +60,11 @@ var appConfig config.Config
 
 // initConfig reads in config file and ENV variables if set.
 func initConfig() {
+	if viper.ConfigFileUsed() != "" {
+		// Config already loaded
+		return
+	}
+
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
 	viper.AddConfigPath(".") // Search in current directory

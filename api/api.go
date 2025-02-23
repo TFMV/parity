@@ -27,6 +27,7 @@ type Server struct {
 	port string
 }
 
+// ServerOptions defines the configuration for the server.
 type ServerOptions struct {
 	Port    string
 	Prefork bool
