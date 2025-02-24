@@ -4,6 +4,58 @@
 
 Parity is a Go-based, high-performance data validation framework that ensures data consistency across different databases. It leverages Apache Arrow for in-memory processing, parallelized execution, and structured reporting.
 
+## 🏗 Architecture
+
+```mermaid
+graph TB
+    subgraph CLI
+        cmd[cmd/parity.go]
+        cmd --> start[start command]
+        cmd --> validate[validate-config command]
+        cmd --> run[run command]
+        cmd --> version[version command]
+    end
+
+    subgraph Core
+        validator[validation/validator.go]
+        config[config/config.go]
+        metrics[metrics/metrics.go]
+        logger[logger/logger.go]
+    end
+
+    subgraph API
+        api[api/api.go]
+        api --> health[/health/]
+        api --> metrics_endpoint[/metrics/]
+        api --> version_endpoint[/version/]
+    end
+
+    subgraph Integrations
+        db_interface[integrations/integration.go]
+        db_interface --> postgres[postgres/postgres.go]
+        db_interface --> duckdb[duckdb/duckdb.go]
+    end
+
+    subgraph Reports
+        report[report/report.go]
+        report --> json[JSON Reports]
+        report --> html[HTML Reports]
+    end
+
+    start --> api
+    validate --> config
+    run --> validator
+    validator --> db_interface
+    validator --> metrics
+    validator --> report
+    validator --> logger
+
+    classDef primary fill:#f9f,stroke:#333,stroke-width:2px
+    classDef secondary fill:#bbf,stroke:#333,stroke-width:1px
+    class cmd,validator,api primary
+    class config,metrics,logger,report,db_interface secondary
+```
+
 ## Features
 
 | Feature | Description |
