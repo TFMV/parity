@@ -163,131 +163,103 @@ func (d *ArrowDiffer) readDataset(ctx context.Context, reader core.DatasetReader
 			break
 		}
 
-		// Add the record to our list, we'll combine them later
+		// Retain the record before adding it to our list
+		// This is safer than cloning as it properly handles reference counting
+		record.Retain()
 		records = append(records, record)
 	}
 
 	// Combine all records into a single record
 	if len(records) == 0 {
 		// Return an empty record with the schema
-		// Create empty arrays for each field in the schema
-		cols := make([]arrow.Array, schema.NumFields())
-		for i, field := range schema.Fields() {
-			// Create an empty array of the appropriate type
-			switch field.Type.ID() {
-			case arrow.INT64:
-				builder := array.NewInt64Builder(d.alloc)
-				cols[i] = builder.NewArray()
-				builder.Release()
-			case arrow.FLOAT64:
-				builder := array.NewFloat64Builder(d.alloc)
-				cols[i] = builder.NewArray()
-				builder.Release()
-			case arrow.STRING:
-				builder := array.NewStringBuilder(d.alloc)
-				cols[i] = builder.NewArray()
-				builder.Release()
-			case arrow.BOOL:
-				builder := array.NewBooleanBuilder(d.alloc)
-				cols[i] = builder.NewArray()
-				builder.Release()
-			default:
-				// For other types, create a generic null array
-				builder := array.NewNullBuilder(d.alloc)
-				cols[i] = builder.NewArray()
-				builder.Release()
-			}
-		}
-		record := array.NewRecord(schema, cols, 0)
-		// Release the arrays after creating the record
-		for _, col := range cols {
-			defer col.Release()
-		}
-		return record, nil
+		return createEmptyRecord(d.alloc, schema), nil
 	}
 
-	// Use the array.NewTableFromRecords and convert back to a Record
+	// If there's only one record, return a clone to ensure ownership
+	if len(records) == 1 {
+		result := cloneRecord(d.alloc, records[0])
+		// Release the original after cloning
+		records[0].Release()
+		return result, nil
+	}
+
+	// Use tableFromRecords to combine multiple records efficiently
+	result, err := tableToRecord(d.alloc, schema, records)
+
+	// Release all records after combining them
+	for _, r := range records {
+		r.Release()
+	}
+
+	return result, err
+}
+
+// createEmptyRecord creates an empty record with the given schema
+func createEmptyRecord(alloc memory.Allocator, schema *arrow.Schema) arrow.Record {
+	// Create empty arrays for each field in the schema
+	cols := make([]arrow.Array, schema.NumFields())
+	for i, field := range schema.Fields() {
+		// Create an empty array of the appropriate type
+		arrBuilder := array.NewBuilder(alloc, field.Type)
+		cols[i] = arrBuilder.NewArray()
+		arrBuilder.Release()
+	}
+
+	// Create the empty record
+	record := array.NewRecord(schema, cols, 0)
+
+	// Release the arrays after creating the record
+	for _, col := range cols {
+		col.Release()
+	}
+
+	return record
+}
+
+// cloneRecord creates a deep copy of a record to ensure ownership
+func cloneRecord(alloc memory.Allocator, record arrow.Record) arrow.Record {
+	schema := record.Schema()
+
+	// Create new arrays for each column
+	cols := make([]arrow.Array, record.NumCols())
+	for i, col := range record.Columns() {
+		// Create a new array from the data in the original
+		cols[i] = array.MakeFromData(col.Data())
+	}
+
+	// Create a new record with the cloned data
+	return array.NewRecord(schema, cols, record.NumRows())
+}
+
+// tableToRecord efficiently converts a set of records to a single record
+func tableToRecord(alloc memory.Allocator, schema *arrow.Schema, records []arrow.Record) (arrow.Record, error) {
+	if len(records) == 0 {
+		return nil, fmt.Errorf("no records to combine")
+	}
+
+	// Combine records into a table
 	table := array.NewTableFromRecords(schema, records)
 	defer table.Release()
 
-	// Create a record batch reader from the table
-	reader2 := array.NewTableReader(table, 0)
-	defer reader2.Release()
-
-	// Read all batches
-	var allBatches []arrow.Record
-	for reader2.Next() {
-		batch := reader2.Record()
-		allBatches = append(allBatches, batch.NewSlice(0, batch.NumRows()))
+	// Determine the total number of rows
+	totalRows := int64(0)
+	for _, rec := range records {
+		totalRows += rec.NumRows()
 	}
 
-	if len(allBatches) == 0 {
-		// Return an empty record with the schema
-		// Create empty arrays for each field in the schema
-		cols := make([]arrow.Array, schema.NumFields())
-		for i, field := range schema.Fields() {
-			// Create an empty array of the appropriate type
-			switch field.Type.ID() {
-			case arrow.INT64:
-				builder := array.NewInt64Builder(d.alloc)
-				cols[i] = builder.NewArray()
-				builder.Release()
-			case arrow.FLOAT64:
-				builder := array.NewFloat64Builder(d.alloc)
-				cols[i] = builder.NewArray()
-				builder.Release()
-			case arrow.STRING:
-				builder := array.NewStringBuilder(d.alloc)
-				cols[i] = builder.NewArray()
-				builder.Release()
-			case arrow.BOOL:
-				builder := array.NewBooleanBuilder(d.alloc)
-				cols[i] = builder.NewArray()
-				builder.Release()
-			default:
-				// For other types, create a generic null array
-				builder := array.NewNullBuilder(d.alloc)
-				cols[i] = builder.NewArray()
-				builder.Release()
-			}
-		}
-		record := array.NewRecord(schema, cols, 0)
-		// Release the arrays after creating the record
-		for _, col := range cols {
-			defer col.Release()
-		}
-		return record, nil
+	// Use a TableReader to get a consolidated record
+	tableReader := array.NewTableReader(table, totalRows)
+	defer tableReader.Release()
+
+	if !tableReader.Next() {
+		return nil, fmt.Errorf("failed to read combined table")
 	}
 
-	if len(allBatches) == 1 {
-		return allBatches[0], nil
-	}
+	// Get the consolidated record
+	record := tableReader.Record()
 
-	// Create a new RecordBuilder and append all records
-	rb := array.NewRecordBuilder(d.alloc, schema)
-	defer rb.Release()
-
-	for _, batch := range allBatches {
-		for i, col := range batch.Columns() {
-			for j := 0; j < col.Len(); j++ {
-				if col.IsNull(j) {
-					rb.Field(i).AppendNull()
-				} else {
-					// This is a simplification, would need type-specific handling
-					// for a complete implementation
-					val := col.GetOneForMarshal(j)
-					if val != nil {
-						rb.Field(i).AppendValueFromString(fmt.Sprintf("%v", val))
-					} else {
-						rb.Field(i).AppendNull()
-					}
-				}
-			}
-		}
-		batch.Release()
-	}
-
-	return rb.NewRecord(), nil
+	// Create a new record that we own and return it
+	return cloneRecord(alloc, record), nil
 }
 
 // computeDiff computes differences between two records (tables) using Arrow's compute functions.

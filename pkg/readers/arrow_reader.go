@@ -73,6 +73,8 @@ func (r *ArrowReader) Read(ctx context.Context) (arrow.Record, error) {
 	// If we've already read some records and there are more to return
 	if r.currentRec < len(r.records) {
 		record := r.records[r.currentRec]
+		// Explicitly retain the record before returning it
+		record.Retain()
 		r.currentRec++
 		return record, nil
 	}
@@ -101,17 +103,27 @@ func (r *ArrowReader) Read(ctx context.Context) (arrow.Record, error) {
 		// Check for context cancellation
 		select {
 		case <-ctx.Done():
+			// Clean up any records we've loaded in this batch
+			for _, rec := range r.records {
+				rec.Release()
+			}
+			r.records = r.records[:0]
 			return nil, ctx.Err()
 		default:
 		}
 
 		record, err := r.reader.Record(int(r.currentIdx))
 		if err != nil {
+			// Clean up any records we've loaded in this batch
+			for _, rec := range r.records {
+				rec.Release()
+			}
+			r.records = r.records[:0]
 			return nil, fmt.Errorf("failed to read record at index %d: %w", r.currentIdx, err)
 		}
 
-		// Clone the record to ensure we own it
-		clonedRecord := array.NewRecord(record.Schema(), record.Columns(), record.NumRows())
+		// Create a copy that we own
+		clonedRecord := r.cloneRecord(record)
 		r.records = append(r.records, clonedRecord)
 		r.currentIdx++
 	}
@@ -121,10 +133,24 @@ func (r *ArrowReader) Read(ctx context.Context) (arrow.Record, error) {
 		return nil, io.EOF
 	}
 
-	// Return the first record
+	// Return the first record and retain it
 	record := r.records[0]
+	record.Retain()
 	r.currentRec = 1
 	return record, nil
+}
+
+// cloneRecord creates a deep copy of a record to ensure ownership
+func (r *ArrowReader) cloneRecord(record arrow.Record) arrow.Record {
+	// Create new arrays for each column
+	cols := make([]arrow.Array, record.NumCols())
+	for i, col := range record.Columns() {
+		// Create a new array from the data in the original
+		cols[i] = array.MakeFromData(col.Data())
+	}
+
+	// Create a new record with the cloned data
+	return array.NewRecord(record.Schema(), cols, record.NumRows())
 }
 
 // ReadAll reads all records from the Arrow file into a single record.
@@ -146,6 +172,25 @@ func (r *ArrowReader) ReadAll(ctx context.Context) (arrow.Record, error) {
 
 	// Reset position to start of file
 	r.currentIdx = 0
+
+	// Fast path: if there are no records, return an empty record
+	if r.reader.NumRecords() == 0 {
+		return r.createEmptyRecord(), nil
+	}
+
+	// Fast path: if there's only one record, just return it
+	if r.reader.NumRecords() == 1 {
+		record, err := r.reader.Record(0)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read single record: %w", err)
+		}
+
+		result := r.cloneRecord(record)
+		r.records = []arrow.Record{result}
+		r.currentRec = 1
+		result.Retain() // Retain before returning
+		return result, nil
+	}
 
 	// Read all records
 	var allRecords []arrow.Record
@@ -171,47 +216,20 @@ func (r *ArrowReader) ReadAll(ctx context.Context) (arrow.Record, error) {
 		}
 
 		// Clone the record to ensure we own it
-		clonedRecord := array.NewRecord(record.Schema(), record.Columns(), record.NumRows())
+		clonedRecord := r.cloneRecord(record)
 		allRecords = append(allRecords, clonedRecord)
 		r.currentIdx++
 	}
 
-	// If we didn't read any records, return EOF
-	if len(allRecords) == 0 {
-		return nil, io.EOF
-	}
-
-	// If we only got one record, just return it
-	if len(allRecords) == 1 {
-		r.records = allRecords
-		r.currentRec = 1
-		return allRecords[0], nil
-	}
-
-	// Otherwise, combine all records into one
-	combinedTable := array.NewTableFromRecords(r.schema, allRecords)
-	defer combinedTable.Release()
-
-	// Create a record batch reader from the table
-	tableReader := array.NewTableReader(combinedTable, combinedTable.NumRows())
-	defer tableReader.Release()
-
-	// Read the combined record
-	if !tableReader.Next() {
-		// Clean up records
+	// Combine all records into one using the tableToRecord approach
+	result, err := r.tableToRecord(allRecords)
+	if err != nil {
+		// Clean up records on error
 		for _, rec := range allRecords {
 			rec.Release()
 		}
-		if tableReader.Err() != nil {
-			return nil, tableReader.Err()
-		}
-		return nil, fmt.Errorf("unexpected error: failed to read combined record")
+		return nil, err
 	}
-
-	combinedRecord := tableReader.Record()
-
-	// Create a new record that we own
-	result := array.NewRecord(r.schema, combinedRecord.Columns(), combinedRecord.NumRows())
 
 	// Clean up individual records since we now have a combined one
 	for _, rec := range allRecords {
@@ -222,7 +240,63 @@ func (r *ArrowReader) ReadAll(ctx context.Context) (arrow.Record, error) {
 	r.records = []arrow.Record{result}
 	r.currentRec = 1
 
+	// Retain it before returning
+	result.Retain()
 	return result, nil
+}
+
+// tableToRecord efficiently converts a set of records to a single record
+func (r *ArrowReader) tableToRecord(records []arrow.Record) (arrow.Record, error) {
+	if len(records) == 0 {
+		return nil, fmt.Errorf("no records to combine")
+	}
+
+	// Combine records into a table
+	table := array.NewTableFromRecords(r.schema, records)
+	defer table.Release()
+
+	// Determine the total number of rows
+	totalRows := int64(0)
+	for _, rec := range records {
+		totalRows += rec.NumRows()
+	}
+
+	// Use a TableReader to get a consolidated record
+	tableReader := array.NewTableReader(table, totalRows)
+	defer tableReader.Release()
+
+	if !tableReader.Next() {
+		if tableReader.Err() != nil {
+			return nil, tableReader.Err()
+		}
+		return nil, fmt.Errorf("failed to read combined table")
+	}
+
+	// Get the consolidated record and clone it
+	record := tableReader.Record()
+	return r.cloneRecord(record), nil
+}
+
+// createEmptyRecord creates an empty record with the given schema
+func (r *ArrowReader) createEmptyRecord() arrow.Record {
+	// Create empty arrays for each field in the schema
+	cols := make([]arrow.Array, r.schema.NumFields())
+	for i, field := range r.schema.Fields() {
+		// Create an empty array of the appropriate type
+		arrBuilder := array.NewBuilder(r.alloc, field.Type)
+		cols[i] = arrBuilder.NewArray()
+		arrBuilder.Release()
+	}
+
+	// Create the empty record
+	record := array.NewRecord(r.schema, cols, 0)
+
+	// Release the arrays after creating the record
+	for _, col := range cols {
+		col.Release()
+	}
+
+	return record
 }
 
 // Schema returns the schema of the dataset.
