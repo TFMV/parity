@@ -498,9 +498,3 @@ func TestCreateModifiedSchema(t *testing.T) {
 	_, ok = meta.GetValue("modification_time")
 	assert.True(t, ok)
 }
-
-// Skip the integration test as it requires more complex mocking and
-// depends on specific implementation details that may change
-func TestIntegrationDiff(t *testing.T) {
-	t.Skip("Skipping integration test which is more sensitive to implementation details")
-}
