@@ -7,6 +7,7 @@ Parity is a high-performance dataset comparison tool designed to efficiently det
 - **High-Speed Dataset Diffing**: Compare large datasets efficiently using vectorized, batch-wise operations
 - **Multiple Data Sources**: Support for Arrow IPC, Parquet, CSV files, and ADBC-compatible databases
 - **Comprehensive Diff Reports**: Identify added, deleted, and modified records with column-level detail
+- **Schema Validation**: Validate and compare Apache Arrow schemas with customizable rules
 - **Arrow-Powered Analysis**: Leverage Arrow's in-memory columnar format for high-performance operations
 - **Flexible Memory Management**: Process data in streaming batches or load complete datasets based on your needs
 - **Parallel Execution**: Utilize Go's concurrency model for processing partitions simultaneously
@@ -114,6 +115,77 @@ Key features:
 ### DuckDBDiffer
 
 A DuckDB-based differ can be added by the community or I can add if needed.
+
+## Schema Validation
+
+Parity includes a schema validation system for Apache Arrow schemas. The schema functionality allows you to:
+
+- Validate a single schema against a set of rules
+- Compare two schemas for compatibility
+- Enforce rules for field types, nullability, and encoding
+- Support different validation levels for schema evolution
+
+### Basic Schema Validation
+
+Validate a single schema:
+
+```bash
+parity schema dataset.parquet
+```
+
+Compare two schemas for compatibility:
+
+```bash
+parity schema source.parquet target.parquet
+```
+
+### Validation Rules
+
+Require specific fields to be present:
+
+```bash
+parity schema --required id,name,timestamp dataset.parquet
+```
+
+Ensure certain fields are not nullable:
+
+```bash
+parity schema --non-nullable id,primary_key dataset.parquet
+```
+
+Enforce dictionary encoding for string fields:
+
+```bash
+parity schema --require-dict-encoding dataset.parquet
+```
+
+Validate temporal fields:
+
+```bash
+parity schema --require-utc --timestamp-fields created_at,updated_at dataset.parquet
+```
+
+### Validation Levels
+
+Parity supports three validation levels:
+
+- **Strict**: Requires exact schema matches (types, names, nullability)
+- **Compatible** (default): Allows schema evolution (adding fields, relaxing nullability)
+- **Relaxed**: Only checks that common fields have compatible types
+
+Specify the validation level:
+
+```bash
+parity schema --level strict source.parquet target.parquet
+```
+
+### Output Options
+
+Output validation results as text (default) or JSON:
+
+```bash
+parity schema --format json dataset.parquet
+```
 
 ## Architecture
 
