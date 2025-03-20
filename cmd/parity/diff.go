@@ -68,12 +68,12 @@ the differences in multiple formats (Parquet, Arrow, JSON, Markdown, HTML).`,
 	}
 
 	// Add flags
-	cmd.Flags().StringVar(&options.SourceType, "source-type", options.SourceType, "Source dataset type (parquet, arrow, csv, duckdb, auto)")
-	cmd.Flags().StringVar(&options.TargetType, "target-type", options.TargetType, "Target dataset type (parquet, arrow, csv, duckdb, auto)")
+	cmd.Flags().StringVar(&options.SourceType, "source-type", options.SourceType, "Source dataset type (parquet, arrow, csv, auto)")
+	cmd.Flags().StringVar(&options.TargetType, "target-type", options.TargetType, "Target dataset type (parquet, arrow, csv, auto)")
 	cmd.Flags().StringSliceVar(&options.KeyColumns, "key", nil, "Key columns to match records")
 	cmd.Flags().StringSliceVar(&options.IgnoreColumns, "ignore", nil, "Columns to ignore in comparison")
 	cmd.Flags().StringVarP(&options.OutputPath, "output", "o", "", "Output path for diff results")
-	cmd.Flags().StringVarP(&options.OutputFormat, "format", "f", options.OutputFormat, "Output format (parquet, arrow, json, markdown, html)")
+	cmd.Flags().StringVarP(&options.OutputFormat, "format", "f", options.OutputFormat, "Output format (parquet, arrow, json)")
 	cmd.Flags().Float64Var(&options.Tolerance, "tolerance", options.Tolerance, "Tolerance for floating point comparisons")
 	cmd.Flags().BoolVar(&options.Parallel, "parallel", options.Parallel, "Use parallel processing")
 	cmd.Flags().Int64Var(&options.BatchSize, "batch-size", options.BatchSize, "Batch size for processing")
@@ -121,7 +121,7 @@ func runDiff(options *DiffOptions) error {
 	defer targetReader.Close()
 
 	// Create differ
-	differ, err := diff.NewDuckDBDiffer()
+	differ, err := diff.NewArrowDiffer()
 	if err != nil {
 		return fmt.Errorf("failed to create differ: %w", err)
 	}
