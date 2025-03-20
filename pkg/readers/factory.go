@@ -45,5 +45,4 @@ func init() {
 	DefaultFactory.Register("parquet", NewParquetReader)
 	DefaultFactory.Register("arrow", NewArrowReader)
 	DefaultFactory.Register("csv", NewCSVReader)
-	DefaultFactory.Register("duckdb", NewDuckDBReader)
 }
