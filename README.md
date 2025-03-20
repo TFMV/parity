@@ -111,6 +111,10 @@ Key features:
 - Type-aware comparisons with configurable tolerance for numeric values
 - Support for parallel processing
 
+### DuckDBDiffer
+
+A DuckDB-based differ can be added by the community or I can add if needed.
+
 ## Architecture
 
 Parity is designed with a modular architecture that separates different concerns:
