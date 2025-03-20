@@ -27,3 +27,17 @@ data/
 validation/parity.log
 .DS_Store
 parity.log
+
+# go-duckdb-main
+go-duckdb-main/
+
+# archery-main
+archery-main/
+
+# go-duckdb-main
+go-duckdb-main/
+
+# arrow-main
+arrow-go-main/
+
+objective.md
