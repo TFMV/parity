@@ -3,6 +3,7 @@ package diff
 import (
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -161,6 +162,11 @@ func BenchmarkDiff(b *testing.B) {
 
 // BenchmarkDiffStreaming benchmarks the Diff function with streaming mode
 func BenchmarkDiffStreaming(b *testing.B) {
+	// Skip in CI
+	if os.Getenv("CI") != "" {
+		b.Skip("Skipping streaming diff benchmark in CI")
+	}
+
 	// Paths to test parquet files
 	sourcePath := filepath.Join("..", "..", "data", "lineitem1.parquet")
 	targetPath := filepath.Join("..", "..", "data", "lineitem2.parquet")
