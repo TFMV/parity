@@ -8,7 +8,7 @@ Parity is a high-performance dataset comparison tool designed to efficiently det
 - **Multiple Data Sources**: Support for Arrow IPC, Parquet, CSV files, and ADBC-compatible databases
 - **Comprehensive Diff Reports**: Identify added, deleted, and modified records with column-level detail
 - **Arrow-Powered Analysis**: Leverage Arrow's in-memory columnar format for high-performance operations
-- **Streaming Processing**: Handle multi-terabyte datasets without loading them entirely in memory
+- **Flexible Memory Management**: Process data in streaming batches or load complete datasets based on your needs
 - **Parallel Execution**: Utilize Go's concurrency model for processing partitions simultaneously
 - **Flexible Output**: Export results in various formats including Arrow IPC, Parquet, JSON, Markdown, and HTML
 
@@ -70,6 +70,47 @@ Change output format:
 parity diff --format json --output diffs.json source.parquet target.parquet
 ```
 
+Enable parallel processing with a specific number of workers:
+
+```bash
+parity diff --parallel --workers 8 source.parquet target.parquet
+```
+
+### Memory Management Strategies
+
+Control memory usage based on your dataset size:
+
+For large datasets (streaming mode):
+
+```bash
+parity diff --batch-size 10000 --stream large_source.parquet large_target.parquet
+```
+
+For smaller datasets (full load mode):
+
+```bash
+parity diff --full-load source.parquet target.parquet
+```
+
+## Diff Strategies
+
+Parity provides different diff strategies to suit your needs:
+
+### ArrowDiffer (Default)
+
+The default Arrow-based differ uses the Apache Arrow columnar format for high-performance comparisons:
+
+```bash
+parity diff --differ arrow source.parquet target.parquet
+```
+
+Key features:
+
+- Vectorized operations for maximum performance
+- Efficient memory usage with the option to load full datasets or process record batches
+- Type-aware comparisons with configurable tolerance for numeric values
+- Support for parallel processing
+
 ## Architecture
 
 Parity is designed with a modular architecture that separates different concerns:
@@ -87,6 +128,11 @@ Parity is designed with a modular architecture that separates different concerns
 - `ArrowReader`: Reads data from Arrow IPC files
 - `CSVReader`: Reads and converts CSV data to Arrow format
 
+All readers support both streaming batch processing and full dataset loading through:
+
+- `Read()`: Returns the next batch of records
+- `ReadAll()`: Loads the entire dataset into memory at once
+
 ### Dataset Writers
 
 - `ParquetWriter`: Writes data to Parquet files
@@ -103,7 +149,7 @@ Parity is designed with a modular architecture that separates different concerns
 
 The Arrow differ works by:
 
-1. Loading input datasets into memory as Arrow records
+1. Loading input datasets (either fully or in batches) as Arrow records
 2. Building key arrays for efficient record matching
 3. Comparing columns with type-aware logic and customizable tolerance
 4. Identifying added, deleted, and modified records
@@ -115,6 +161,24 @@ The process is highly optimized for both memory usage and performance, with feat
 - Efficient key-based record matching
 - Type-aware comparisons with customizable tolerance for floating-point values
 - Parallel comparison of records with configurable worker pools
+
+### Memory Management
+
+Parity offers two main memory management approaches:
+
+**Streaming Mode (Default)**:
+
+- Processes data in batches, with configurable batch size
+- Minimizes memory footprint for large datasets
+- Ideal for production environments with memory constraints
+
+**Full Load Mode**:
+
+- Loads entire datasets into memory
+- Provides maximum performance for smaller datasets
+- Best for interactive use and small to medium datasets
+
+Control this behavior with the `--batch-size` and `--full-load` options.
 
 ### Arrow Optimizations
 
@@ -150,8 +214,19 @@ To add a new data source reader, implement the `core.DatasetReader` interface:
 
 ```go
 type DatasetReader interface {
+    // Read returns a record batch and an error if any.
+    // Returns io.EOF when there are no more batches.
     Read(ctx context.Context) (arrow.Record, error)
+    
+    // ReadAll reads all records from the dataset into a single record.
+    // This is useful for small datasets, but may use a lot of memory for large datasets.
+    // Returns io.EOF if there are no records.
+    ReadAll(ctx context.Context) (arrow.Record, error)
+    
+    // Schema returns the schema of the dataset.
     Schema() *arrow.Schema
+    
+    // Close closes the reader and releases resources.
     Close() error
 }
 ```
@@ -162,6 +237,90 @@ To add a new output format writer, implement the `core.DatasetWriter` interface:
 type DatasetWriter interface {
     Write(ctx context.Context, record arrow.Record) error
     Close() error
+}
+```
+
+### Adding New Diff Engines
+
+To add a new diff engine, implement the `core.Differ` interface:
+
+```go
+type Differ interface {
+    // Diff computes the difference between two datasets.
+    Diff(ctx context.Context, source, target DatasetReader, options DiffOptions) (*DiffResult, error)
+}
+```
+
+## Examples
+
+### Comparing Large Production Datasets
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+
+    "github.com/TFMV/parity/pkg/core"
+    "github.com/TFMV/parity/pkg/diff"
+    "github.com/TFMV/parity/pkg/readers"
+)
+
+func main() {
+    // Create source and target readers
+    sourceConfig := core.ReaderConfig{
+        Type:      "parquet",
+        Path:      "large_source.parquet",
+        BatchSize: 10000, // Process in batches of 10,000 rows
+    }
+    
+    targetConfig := core.ReaderConfig{
+        Type:      "parquet",
+        Path:      "large_target.parquet",
+        BatchSize: 10000,
+    }
+    
+    sourceReader, err := readers.DefaultFactory.Create(sourceConfig)
+    if err != nil {
+        log.Fatalf("Failed to create source reader: %v", err)
+    }
+    defer sourceReader.Close()
+    
+    targetReader, err := readers.DefaultFactory.Create(targetConfig)
+    if err != nil {
+        log.Fatalf("Failed to create target reader: %v", err)
+    }
+    defer targetReader.Close()
+    
+    // Create differ with options
+    differ, err := diff.NewArrowDiffer()
+    if err != nil {
+        log.Fatalf("Failed to create differ: %v", err)
+    }
+    defer differ.Close()
+    
+    // Configure diff options
+    options := core.DiffOptions{
+        KeyColumns:    []string{"id", "timestamp"},
+        IgnoreColumns: []string{"updated_at"},
+        BatchSize:     10000,
+        Tolerance:     0.0001,
+        Parallel:      true,
+        NumWorkers:    8,
+    }
+    
+    // Perform diff
+    ctx := context.Background()
+    result, err := differ.Diff(ctx, sourceReader, targetReader, options)
+    if err != nil {
+        log.Fatalf("Failed to diff datasets: %v", err)
+    }
+    
+    // Print summary
+    log.Printf("Total records: Source=%d, Target=%d", result.Summary.TotalSource, result.Summary.TotalTarget)
+    log.Printf("Differences: Added=%d, Deleted=%d, Modified=%d", 
+        result.Summary.Added, result.Summary.Deleted, result.Summary.Modified)
 }
 ```
 
