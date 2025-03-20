@@ -120,6 +120,19 @@ func (d *ArrowDiffer) validateSchemas(sourceSchema, targetSchema *arrow.Schema, 
 
 // readDataset reads all records from a dataset into a single table.
 func (d *ArrowDiffer) readDataset(ctx context.Context, reader core.DatasetReader) (arrow.Record, error) {
+	// Check if the reader implements the ReadAll method
+	if readAllReader, ok := reader.(interface {
+		ReadAll(context.Context) (arrow.Record, error)
+	}); ok {
+		// Use the ReadAll method if available
+		record, err := readAllReader.ReadAll(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return record, nil
+	}
+
+	// Fallback to the original implementation for readers that don't have ReadAll
 	schema := reader.Schema()
 
 	var records []arrow.Record

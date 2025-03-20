@@ -14,6 +14,11 @@ type DatasetReader interface {
 	// Returns io.EOF when there are no more batches.
 	Read(ctx context.Context) (arrow.Record, error)
 
+	// ReadAll reads all records from the dataset into a single record.
+	// This is useful for small datasets, but may use a lot of memory for large datasets.
+	// Returns io.EOF if there are no records.
+	ReadAll(ctx context.Context) (arrow.Record, error)
+
 	// Schema returns the schema of the dataset.
 	Schema() *arrow.Schema
 
@@ -132,6 +137,9 @@ type WriterConfig struct {
 type Differ interface {
 	// Diff computes the difference between two datasets.
 	Diff(ctx context.Context, source, target DatasetReader, options DiffOptions) (*DiffResult, error)
+
+	// Close closes the differ and releases any resources.
+	Close() error
 }
 
 // Reporter defines an interface for generating reports from diff results.

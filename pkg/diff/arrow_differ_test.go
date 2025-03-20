@@ -2,6 +2,7 @@ package diff
 
 import (
 	"context"
+	"io"
 	"math"
 	"testing"
 
@@ -25,6 +26,13 @@ func (m *mockDatasetReader) Read(ctx context.Context) (arrow.Record, error) {
 		return nil, error(nil)
 	}
 	m.read = true
+	return m.record, nil
+}
+
+func (m *mockDatasetReader) ReadAll(ctx context.Context) (arrow.Record, error) {
+	if m.record == nil {
+		return nil, io.EOF
+	}
 	return m.record, nil
 }
 

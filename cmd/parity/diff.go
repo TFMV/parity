@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/TFMV/parity/pkg/diff"
 	"github.com/TFMV/parity/pkg/readers"
 	"github.com/TFMV/parity/pkg/writers"
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/spf13/cobra"
 )
 
@@ -28,6 +30,10 @@ type DiffOptions struct {
 	Tolerance     float64
 	Parallel      bool
 	BatchSize     int64
+	NumWorkers    int
+	FullLoad      bool
+	Stream        bool
+	DifferType    string
 }
 
 // newDiffCommand creates a new diff command.
@@ -39,6 +45,10 @@ func newDiffCommand() *cobra.Command {
 		Tolerance:    0.0001,
 		Parallel:     true,
 		BatchSize:    10000,
+		NumWorkers:   4,
+		FullLoad:     false,
+		Stream:       false,
+		DifferType:   "arrow",
 	}
 
 	cmd := &cobra.Command{
@@ -47,7 +57,11 @@ func newDiffCommand() *cobra.Command {
 		Long: `The diff command compares two datasets and computes the differences between them.
 		
 It supports various input formats (Parquet, Arrow, CSV, database) and can output
-the differences in multiple formats (Parquet, Arrow, JSON, Markdown, HTML).`,
+the differences in multiple formats (Parquet, Arrow, JSON, Markdown, HTML).
+
+Memory Management:
+- Use --stream to process in batches (batch size controlled with --batch-size)
+- Use --full-load to load entire datasets into memory at once (for smaller datasets)`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Get source and target paths
@@ -60,6 +74,11 @@ the differences in multiple formats (Parquet, Arrow, JSON, Markdown, HTML).`,
 			}
 			if options.TargetType == "auto" {
 				options.TargetType = detectType(options.TargetPath)
+			}
+
+			// Validate mutually exclusive options
+			if options.FullLoad && options.Stream {
+				return fmt.Errorf("--full-load and --stream cannot be used together")
 			}
 
 			// Run diff
@@ -77,6 +96,10 @@ the differences in multiple formats (Parquet, Arrow, JSON, Markdown, HTML).`,
 	cmd.Flags().Float64Var(&options.Tolerance, "tolerance", options.Tolerance, "Tolerance for floating point comparisons")
 	cmd.Flags().BoolVar(&options.Parallel, "parallel", options.Parallel, "Use parallel processing")
 	cmd.Flags().Int64Var(&options.BatchSize, "batch-size", options.BatchSize, "Batch size for processing")
+	cmd.Flags().IntVar(&options.NumWorkers, "workers", options.NumWorkers, "Number of worker threads for parallel processing")
+	cmd.Flags().BoolVar(&options.FullLoad, "full-load", options.FullLoad, "Load entire datasets into memory for faster processing")
+	cmd.Flags().BoolVar(&options.Stream, "stream", options.Stream, "Process datasets in streaming mode to minimize memory usage")
+	cmd.Flags().StringVar(&options.DifferType, "differ", options.DifferType, "Type of differ to use (arrow)")
 
 	return cmd
 }
@@ -95,6 +118,18 @@ func runDiff(options *DiffOptions) error {
 		fmt.Println("Received signal, cancelling...")
 		cancel()
 	}()
+
+	// Set default memory management strategy if neither is specified
+	if !options.FullLoad && !options.Stream {
+		// By default, we'll use streaming for large batch sizes and full load for small ones
+		if options.BatchSize > 100000 {
+			options.Stream = true
+			fmt.Println("Using streaming mode for large batch size")
+		} else {
+			options.FullLoad = true
+			fmt.Println("Using full load mode for small batch size")
+		}
+	}
 
 	// Create source reader
 	sourceConfig := core.ReaderConfig{
@@ -120,11 +155,18 @@ func runDiff(options *DiffOptions) error {
 	}
 	defer targetReader.Close()
 
-	// Create differ
-	differ, err := diff.NewArrowDiffer()
-	if err != nil {
-		return fmt.Errorf("failed to create differ: %w", err)
+	// Create differ based on selected type
+	var differ core.Differ
+	switch options.DifferType {
+	case "arrow":
+		differ, err = diff.NewArrowDiffer()
+		if err != nil {
+			return fmt.Errorf("failed to create Arrow differ: %w", err)
+		}
+	default:
+		return fmt.Errorf("unsupported differ type: %s", options.DifferType)
 	}
+
 	defer differ.Close()
 
 	// Configure diff options
@@ -134,11 +176,33 @@ func runDiff(options *DiffOptions) error {
 		BatchSize:     options.BatchSize,
 		Tolerance:     options.Tolerance,
 		Parallel:      options.Parallel,
+		NumWorkers:    options.NumWorkers,
+	}
+
+	// If using full load mode, wrap the readers to use ReadAll
+	var sourceReaderToUse, targetReaderToUse core.DatasetReader
+
+	if options.FullLoad {
+		fmt.Println("Loading datasets fully into memory...")
+
+		// Create wrappers that use ReadAll
+		sourceReaderToUse = &fullLoadReader{reader: sourceReader}
+		targetReaderToUse = &fullLoadReader{reader: targetReader}
+	} else if options.Stream {
+		fmt.Println("Using streaming mode to minimize memory usage...")
+
+		// Use the original readers directly
+		sourceReaderToUse = sourceReader
+		targetReaderToUse = targetReader
+	} else {
+		// Let the differ decide based on its detection of ReadAll support
+		sourceReaderToUse = sourceReader
+		targetReaderToUse = targetReader
 	}
 
 	// Compute diff
 	fmt.Println("Computing differences...")
-	result, err := differ.Diff(ctx, sourceReader, targetReader, diffOptions)
+	result, err := differ.Diff(ctx, sourceReaderToUse, targetReaderToUse, diffOptions)
 	if err != nil {
 		return fmt.Errorf("failed to compute diff: %w", err)
 	}
@@ -154,6 +218,53 @@ func runDiff(options *DiffOptions) error {
 	}
 
 	return nil
+}
+
+// fullLoadReader is a wrapper that forces the use of ReadAll for any reader
+type fullLoadReader struct {
+	reader     core.DatasetReader
+	loadedData arrow.Record
+	read       bool
+}
+
+func (f *fullLoadReader) Read(ctx context.Context) (arrow.Record, error) {
+	if f.loadedData == nil {
+		data, err := f.reader.ReadAll(ctx)
+		if err != nil {
+			return nil, err
+		}
+		f.loadedData = data
+	}
+
+	if f.read {
+		return nil, io.EOF
+	}
+
+	f.read = true
+	return f.loadedData, nil
+}
+
+func (f *fullLoadReader) ReadAll(ctx context.Context) (arrow.Record, error) {
+	if f.loadedData == nil {
+		data, err := f.reader.ReadAll(ctx)
+		if err != nil {
+			return nil, err
+		}
+		f.loadedData = data
+	}
+
+	return f.loadedData, nil
+}
+
+func (f *fullLoadReader) Schema() *arrow.Schema {
+	return f.reader.Schema()
+}
+
+func (f *fullLoadReader) Close() error {
+	if f.loadedData != nil {
+		f.loadedData.Release()
+	}
+	return f.reader.Close()
 }
 
 // printSummary prints a summary of the diff results.

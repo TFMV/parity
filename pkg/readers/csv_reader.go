@@ -2,28 +2,26 @@ package readers
 
 import (
 	"context"
-	"encoding/csv"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 
 	"github.com/TFMV/parity/pkg/core"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/csv"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 // CSVReader implements a reader for CSV files, converting to Arrow.
 type CSVReader struct {
-	schema    *arrow.Schema
-	reader    *csv.Reader
-	file      *os.File
-	header    []string
-	batchSize int64
-	alloc     *memory.GoAllocator
-	eof       bool
+	schema        *arrow.Schema
+	file          *os.File
+	reader        *csv.Reader
+	alloc         memory.Allocator
+	records       []arrow.Record
+	currentRecord int
 }
 
 // NewCSVReader creates a new CSV reader.
@@ -32,53 +30,41 @@ func NewCSVReader(config core.ReaderConfig) (core.DatasetReader, error) {
 		return nil, errors.New("path is required for CSV reader")
 	}
 
-	// Set default batch size if not specified
-	batchSize := config.BatchSize
-	if batchSize <= 0 {
-		batchSize = 10000 // Default batch size
-	}
-
+	// Open the file
 	file, err := os.Open(config.Path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open CSV file: %w", err)
 	}
 
-	reader := csv.NewReader(file)
-	reader.ReuseRecord = true // For better performance
-
-	// Read header
-	header, err := reader.Read()
-	if err != nil {
-		file.Close()
-		return nil, fmt.Errorf("failed to read CSV header: %w", err)
+	// Set default chunk size if not specified
+	chunkSize := config.BatchSize
+	if chunkSize <= 0 {
+		chunkSize = 10000 // Default chunk size
 	}
 
-	// Infer schema from header
-	fields := make([]arrow.Field, len(header))
-	for i, name := range header {
-		// Default to string type
-		fields[i] = arrow.Field{Name: name, Type: arrow.BinaryTypes.String}
-	}
+	// Create allocator
+	alloc := memory.NewGoAllocator()
 
-	schema := arrow.NewSchema(fields, nil)
+	// Create CSV reader with inference options
+	reader := csv.NewInferringReader(
+		file,
+		csv.WithChunk(int(chunkSize)),
+		csv.WithHeader(true),
+		csv.WithNullReader(true, ""), // Empty string is treated as null
+		csv.WithAllocator(alloc),
+	)
 
 	return &CSVReader{
-		schema:    schema,
-		reader:    reader,
-		file:      file,
-		header:    header,
-		batchSize: batchSize,
-		alloc:     memory.NewGoAllocator(),
-		eof:       false,
+		file:          file,
+		reader:        reader,
+		alloc:         alloc,
+		records:       make([]arrow.Record, 0),
+		currentRecord: 0,
 	}, nil
 }
 
 // Read returns the next batch of records.
 func (r *CSVReader) Read(ctx context.Context) (arrow.Record, error) {
-	if r.eof {
-		return nil, io.EOF
-	}
-
 	// Check if context is canceled
 	select {
 	case <-ctx.Done():
@@ -86,95 +72,150 @@ func (r *CSVReader) Read(ctx context.Context) (arrow.Record, error) {
 	default:
 	}
 
-	// Create builders for each column
-	builders := make([]array.Builder, len(r.header))
-	for i, field := range r.schema.Fields() {
-		builders[i] = array.NewBuilder(r.alloc, field.Type)
-		defer builders[i].Release()
+	// If we've already read some records and there are more to return
+	if r.currentRecord < len(r.records) {
+		record := r.records[r.currentRecord]
+		r.currentRecord++
+		return record, nil
 	}
 
-	// Read rows in batches
-	var rowCount int64
-	for rowCount < r.batchSize {
-		// Check if context is canceled
+	// Clean up any previously loaded records
+	for _, rec := range r.records {
+		rec.Release()
+	}
+	r.records = r.records[:0]
+	r.currentRecord = 0
+
+	// Read next batch from the CSV reader
+	if !r.reader.Next() {
+		if r.reader.Err() != nil {
+			return nil, fmt.Errorf("failed to read CSV: %w", r.reader.Err())
+		}
+		return nil, io.EOF
+	}
+
+	// Get the schema (only on first read)
+	if r.schema == nil {
+		r.schema = r.reader.Schema()
+	}
+
+	// Get the record and retain it
+	record := r.reader.Record()
+	record.Retain()
+	r.records = append(r.records, record)
+	r.currentRecord = 1 // Move to index 1 since we're returning the first record
+
+	return record, nil
+}
+
+// ReadAll loads all CSV data into memory at once
+// This is useful for smaller files, but be careful with large files
+func (r *CSVReader) ReadAll(ctx context.Context) (arrow.Record, error) {
+	// Check if already read everything
+	if r.currentRecord > 0 && !r.reader.Next() {
+		if r.reader.Err() != nil {
+			return nil, fmt.Errorf("failed to read CSV: %w", r.reader.Err())
+		}
+		return nil, io.EOF
+	}
+
+	// Clean up any previously loaded records
+	for _, rec := range r.records {
+		rec.Release()
+	}
+	r.records = r.records[:0]
+	r.currentRecord = 0
+
+	// Read all records
+	for r.reader.Next() {
+		// Check for context cancellation
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
 		}
 
-		row, err := r.reader.Read()
-		if err == io.EOF {
-			r.eof = true
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to read CSV row: %w", err)
+		// Get the schema (only on first read)
+		if r.schema == nil {
+			r.schema = r.reader.Schema()
 		}
 
-		// Append values to builders
-		for i, val := range row {
-			if i >= len(builders) {
-				continue
-			}
-
-			// Add value to appropriate builder
-			if builder, ok := builders[i].(*array.StringBuilder); ok {
-				builder.Append(val)
-			}
-		}
-
-		rowCount++
+		rec := r.reader.Record()
+		rec.Retain()
+		r.records = append(r.records, rec)
 	}
 
-	// If no rows were read, return EOF
-	if rowCount == 0 {
-		r.eof = true
+	if r.reader.Err() != nil {
+		return nil, fmt.Errorf("failed to read CSV: %w", r.reader.Err())
+	}
+
+	if len(r.records) == 0 {
 		return nil, io.EOF
 	}
 
-	// Build column arrays
-	cols := make([]arrow.Array, len(builders))
-	for i, builder := range builders {
-		cols[i] = builder.NewArray()
-		defer cols[i].Release()
+	// Combine all records into a single record
+	if len(r.records) == 1 {
+		r.currentRecord = 1
+		return r.records[0], nil
 	}
 
-	// Create record batch
-	record := array.NewRecord(r.schema, cols, int64(rowCount))
-	return record, nil
+	// Combine multiple records into one
+	schema := r.schema
+	table := array.NewTableFromRecords(schema, r.records)
+	defer table.Release()
+
+	// Create a record batch reader from the table
+	tableReader := array.NewTableReader(table, table.NumRows())
+	defer tableReader.Release()
+
+	// Read the combined record
+	tableReader.Next()
+	combinedRecord := tableReader.Record()
+	r.currentRecord = len(r.records) // Mark as all read
+
+	// Create a new record that we own
+	result := array.NewRecord(schema, combinedRecord.Columns(), combinedRecord.NumRows())
+	return result, nil
 }
 
 // Schema returns the schema of the dataset.
 func (r *CSVReader) Schema() *arrow.Schema {
+	// If we haven't read any data yet, need to read the first batch to get schema
+	if r.schema == nil && r.reader != nil {
+		if r.reader.Next() {
+			r.schema = r.reader.Schema()
+			// Get the record and retain it for later use
+			record := r.reader.Record()
+			record.Retain()
+			r.records = append(r.records, record)
+		} else if r.reader.Err() != nil {
+			// This is not ideal, but we need to handle the error case
+			return arrow.NewSchema([]arrow.Field{}, nil)
+		}
+	}
 	return r.schema
 }
 
 // Close closes the reader and releases resources.
 func (r *CSVReader) Close() error {
+	// Release all records
+	for _, rec := range r.records {
+		rec.Release()
+	}
+	r.records = nil
+
+	// Release the reader
+	if r.reader != nil {
+		r.reader.Release()
+		r.reader = nil
+	}
+
+	// Close the file
 	if r.file != nil {
-		return r.file.Close()
+		err := r.file.Close()
+		r.file = nil
+		return err
 	}
+
 	return nil
-}
-
-// inferType attempts to infer the type of a value.
-func inferType(val string) arrow.DataType {
-	// Try to convert to int
-	if _, err := strconv.ParseInt(val, 10, 64); err == nil {
-		return arrow.PrimitiveTypes.Int64
-	}
-
-	// Try to convert to float
-	if _, err := strconv.ParseFloat(val, 64); err == nil {
-		return arrow.PrimitiveTypes.Float64
-	}
-
-	// Try to convert to bool
-	if val == "true" || val == "false" {
-		return arrow.FixedWidthTypes.Boolean
-	}
-
-	// Default to string
-	return arrow.BinaryTypes.String
 }
