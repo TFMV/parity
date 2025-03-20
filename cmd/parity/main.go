@@ -30,6 +30,7 @@ between datasets in various formats (Parquet, Arrow, CSV, databases).`,
 
 	// Add subcommands
 	rootCmd.AddCommand(newDiffCommand())
+	rootCmd.AddCommand(newSchemaCommand())
 
 	// Execute the command
 	if err := rootCmd.Execute(); err != nil {
