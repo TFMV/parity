@@ -157,7 +157,40 @@ func (d *ArrowDiffer) readDataset(ctx context.Context, reader core.DatasetReader
 	// Combine all records into a single record
 	if len(records) == 0 {
 		// Return an empty record with the schema
-		return array.NewRecord(schema, []arrow.Array{}, 0), nil
+		// Create empty arrays for each field in the schema
+		cols := make([]arrow.Array, schema.NumFields())
+		for i, field := range schema.Fields() {
+			// Create an empty array of the appropriate type
+			switch field.Type.ID() {
+			case arrow.INT64:
+				builder := array.NewInt64Builder(d.alloc)
+				cols[i] = builder.NewArray()
+				builder.Release()
+			case arrow.FLOAT64:
+				builder := array.NewFloat64Builder(d.alloc)
+				cols[i] = builder.NewArray()
+				builder.Release()
+			case arrow.STRING:
+				builder := array.NewStringBuilder(d.alloc)
+				cols[i] = builder.NewArray()
+				builder.Release()
+			case arrow.BOOL:
+				builder := array.NewBooleanBuilder(d.alloc)
+				cols[i] = builder.NewArray()
+				builder.Release()
+			default:
+				// For other types, create a generic null array
+				builder := array.NewNullBuilder(d.alloc)
+				cols[i] = builder.NewArray()
+				builder.Release()
+			}
+		}
+		record := array.NewRecord(schema, cols, 0)
+		// Release the arrays after creating the record
+		for _, col := range cols {
+			defer col.Release()
+		}
+		return record, nil
 	}
 
 	// Use the array.NewTableFromRecords and convert back to a Record
@@ -176,7 +209,41 @@ func (d *ArrowDiffer) readDataset(ctx context.Context, reader core.DatasetReader
 	}
 
 	if len(allBatches) == 0 {
-		return array.NewRecord(schema, []arrow.Array{}, 0), nil
+		// Return an empty record with the schema
+		// Create empty arrays for each field in the schema
+		cols := make([]arrow.Array, schema.NumFields())
+		for i, field := range schema.Fields() {
+			// Create an empty array of the appropriate type
+			switch field.Type.ID() {
+			case arrow.INT64:
+				builder := array.NewInt64Builder(d.alloc)
+				cols[i] = builder.NewArray()
+				builder.Release()
+			case arrow.FLOAT64:
+				builder := array.NewFloat64Builder(d.alloc)
+				cols[i] = builder.NewArray()
+				builder.Release()
+			case arrow.STRING:
+				builder := array.NewStringBuilder(d.alloc)
+				cols[i] = builder.NewArray()
+				builder.Release()
+			case arrow.BOOL:
+				builder := array.NewBooleanBuilder(d.alloc)
+				cols[i] = builder.NewArray()
+				builder.Release()
+			default:
+				// For other types, create a generic null array
+				builder := array.NewNullBuilder(d.alloc)
+				cols[i] = builder.NewArray()
+				builder.Release()
+			}
+		}
+		record := array.NewRecord(schema, cols, 0)
+		// Release the arrays after creating the record
+		for _, col := range cols {
+			defer col.Release()
+		}
+		return record, nil
 	}
 
 	if len(allBatches) == 1 {

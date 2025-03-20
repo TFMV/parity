@@ -1,13 +1,13 @@
 # Parity
 
-Parity is a high-performance dataset comparison tool designed to efficiently detect and report differences between large datasets. By leveraging the power of Apache Arrow for in-memory columnar data processing and DuckDB for SQL-based operations, Parity can handle massive datasets.
+Parity is a high-performance dataset comparison tool designed to efficiently detect and report differences between large datasets. By leveraging the power of Apache Arrow for in-memory columnar data processing, Parity can handle massive datasets with speed and efficiency.
 
 ## Features
 
 - **High-Speed Dataset Diffing**: Compare large datasets efficiently using vectorized, batch-wise operations
 - **Multiple Data Sources**: Support for Arrow IPC, Parquet, CSV files, and ADBC-compatible databases
 - **Comprehensive Diff Reports**: Identify added, deleted, and modified records with column-level detail
-- **SQL-Powered Analysis**: Leverage DuckDB for high-performance SQL operations on datasets
+- **Arrow-Powered Analysis**: Leverage Arrow's in-memory columnar format for high-performance operations
 - **Streaming Processing**: Handle multi-terabyte datasets without loading them entirely in memory
 - **Parallel Execution**: Utilize Go's concurrency model for processing partitions simultaneously
 - **Flexible Output**: Export results in various formats including Arrow IPC, Parquet, JSON, Markdown, and HTML
@@ -86,54 +86,50 @@ Parity is designed with a modular architecture that separates different concerns
 - `ParquetReader`: Reads data from Parquet files
 - `ArrowReader`: Reads data from Arrow IPC files
 - `CSVReader`: Reads and converts CSV data to Arrow format
-- `DuckDBReader`: Reads data from DuckDB databases
 
 ### Dataset Writers
 
 - `ParquetWriter`: Writes data to Parquet files
 - `ArrowWriter`: Writes data to Arrow IPC files
 - `JSONWriter`: Writes data to JSON files
-- `MarkdownWriter`: Generates Markdown reports
-- `HTMLWriter`: Generates HTML reports
 
 ### Diff Engines
 
-- `DuckDBDiffer`: Uses DuckDB SQL engine for efficient dataset comparison
+- `ArrowDiffer`: Uses Arrow's in-memory columnar format for efficient dataset comparison
 
 ## Technical Details
 
-### DuckDB Diffing Process
+### Arrow Diffing Process
 
-The DuckDB differ works by:
+The Arrow differ works by:
 
-1. Converting input datasets to Parquet files
-2. Loading these files into DuckDB tables
-3. Using SQL to efficiently identify differences
-4. Extracting the differences into Arrow records
-5. Generating comprehensive summary statistics
+1. Loading input datasets into memory as Arrow records
+2. Building key arrays for efficient record matching
+3. Comparing columns with type-aware logic and customizable tolerance
+4. Identifying added, deleted, and modified records
+5. Producing detailed output with indicators for which fields were modified
 
 The process is highly optimized for both memory usage and performance, with features like:
 
-- Batch processing to manage memory footprint
-- Transaction management for large datasets
-- Temporary file management
-- Type-aware comparisons with customizable tolerance
-- Multi-threaded processing
+- Streaming record processing to manage memory footprint
+- Efficient key-based record matching
+- Type-aware comparisons with customizable tolerance for floating-point values
+- Parallel comparison of records with configurable worker pools
 
-### DuckDB Optimizations
+### Arrow Optimizations
 
-Parity configures DuckDB with:
+Parity leverages Arrow's strengths:
 
-- Automatic thread count determination
-- 4GB memory limit for handling large string columns
-- Efficient extraction and insertion of Arrow data
+- Zero-copy operations where possible
+- Columnar data representation for efficient comparison
+- Vectorized operations for high throughput
+- Memory-efficient data structures
 
 ## Development
 
 ### Prerequisites
 
 - Go 1.24 or later
-- DuckDB
 - Apache Arrow libraries
 
 ### Building
@@ -175,6 +171,4 @@ Parity is licensed under the MIT License - see the LICENSE file for details.
 
 ## Acknowledgments
 
-- [Apache Arrow](https://arrow.apache.org/) - For the Arrow columnar memory format
-- [DuckDB](https://duckdb.org/) - For the embedded SQL OLAP database engine
-- [Go-DuckDB](https://github.com/marcboeker/go-duckdb) - For Go bindings to DuckDB
+- [Apache Arrow](https://arrow.apache.org/) - For the Arrow columnar memory format and efficient data processing capabilities
