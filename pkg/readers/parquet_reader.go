@@ -293,10 +293,10 @@ func (r *ParquetReader) Close() error {
 
 	// Close readers - note that we don't need to close arrowReader
 	// as it doesn't have a Close method
-	var err error
+	var err error = nil
 
 	if r.fileReader != nil {
-		if err2 := r.fileReader.Close(); err2 != nil && err == nil {
+		if err2 := r.fileReader.Close(); err2 != nil {
 			err = err2
 		}
 		r.fileReader = nil

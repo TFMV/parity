@@ -73,9 +73,7 @@ func Example_CompareSchemas(sourcePath, targetPath string) error {
 
 	// Read a sample from CSV to ensure schema is populated
 	if _, err := targetReader.Read(context.Background()); err != nil {
-		if err != nil {
-			return fmt.Errorf("failed to read from target: %w", err)
-		}
+		return fmt.Errorf("failed to read from target: %w", err)
 	}
 
 	// Create a validator with compatible validation level
