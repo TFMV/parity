@@ -1,0 +1,62 @@
+# Example schema definition for customer data
+# This file defines validation rules for customer data schemas
+
+# Validation level: strict, compatible, or relaxed
+validation_level: compatible
+
+# Fields that must be present
+required_fields:
+  - customer_id
+  - name
+  - email
+  - created_at
+
+# Fields that must not be nullable
+non_nullable_fields:
+  - customer_id
+  - email
+
+# Allowed field types (maps field names to allowed types)
+field_types:
+  customer_id:
+    - int64
+    - string
+  name:
+    - string
+  email:
+    - string
+  age:
+    - int32
+    - int64
+  score:
+    - float64
+    - decimal(10,2)
+  balance:
+    - decimal(15,2)
+
+# Fields that should be timestamps
+timestamp_fields:
+  - created_at
+  - updated_at
+  - last_login
+
+# Required timezone for timestamp fields
+required_timezone: UTC
+
+# Whether string fields should use dictionary encoding
+string_fields_require_dictionary: true
+
+# Fields exempt from dictionary encoding requirement
+dictionary_exempt_fields:
+  - notes
+  - description
+
+# Decimal precision requirements (precision, scale)
+decimal_precisions:
+  balance: [15, 2]
+  score: [10, 2]
+
+# Required metadata keys
+required_metadata_keys:
+  - schema_version
+  - data_source

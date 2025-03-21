@@ -254,3 +254,35 @@ func IntegrateWithDiffer() {
 		}
 	*/
 }
+
+// Example_UseSchemaFile demonstrates how to use a schema definition file
+// to create and apply validators.
+func Example_UseSchemaFile(schemaFilePath string, dataFilePath string) error {
+	// Load validator from schema file
+	validator, err := NewValidatorFromSchemaFile(schemaFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to create validator from schema file: %w", err)
+	}
+
+	// Create a reader for the data file to validate
+	reader, err := readers.NewArrowReader(core.ReaderConfig{
+		Path: dataFilePath,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create reader for data file: %w", err)
+	}
+	defer reader.Close()
+
+	// Validate the schema of the data file
+	result := validator.ValidateSchema(reader.Schema())
+
+	// Print the schema validation result
+	fmt.Println("==== Schema Validation Result ====")
+	fmt.Println(PrintValidationResult(result))
+
+	// Print the schema itself for reference
+	fmt.Println("==== Schema Details ====")
+	fmt.Println(SchemaToString(reader.Schema()))
+
+	return nil
+}

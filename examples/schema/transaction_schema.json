@@ -1,0 +1,53 @@
+{
+  "validation_level": "strict",
+  
+  "required_fields": [
+    "transaction_id",
+    "customer_id",
+    "amount",
+    "timestamp"
+  ],
+  
+  "non_nullable_fields": [
+    "transaction_id",
+    "customer_id",
+    "amount",
+    "timestamp"
+  ],
+  
+  "field_types": {
+    "transaction_id": ["string"],
+    "customer_id": ["int64", "string"],
+    "amount": ["decimal(10,2)"],
+    "timestamp": ["timestamp[ms]"],
+    "status": ["string"],
+    "payment_method": ["string"]
+  },
+  
+  "timestamp_fields": [
+    "timestamp",
+    "cleared_at",
+    "settlement_date"
+  ],
+  
+  "required_timezone": "UTC",
+  
+  "string_fields_require_dictionary": true,
+  
+  "dictionary_exempt_fields": [
+    "notes",
+    "transaction_details"
+  ],
+  
+  "decimal_precisions": {
+    "amount": [10, 2],
+    "fee": [8, 4],
+    "tax": [8, 2]
+  },
+  
+  "required_metadata_keys": [
+    "schema_version",
+    "transaction_source",
+    "environment"
+  ]
+} 
