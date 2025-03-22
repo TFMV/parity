@@ -269,7 +269,28 @@ func (d *ArrowDiffer) computeDiff(
 	keyColumns []string,
 	options core.DiffOptions,
 ) (*core.DiffResult, error) {
+	// Check if we have key columns - they're essential for large datasets
+	if len(keyColumns) == 0 {
+		// No key columns specified, print performance warning
+		fmt.Println("WARNING: No key columns specified for diffing. This may be extremely slow for large datasets.")
+		fmt.Println("Hint: Specify key columns for better performance.")
+
+		// For large datasets, generate a warning if they're over a certain size
+		if source.NumRows() > 100000 || target.NumRows() > 100000 {
+			fmt.Printf("Large dataset detected: %d source rows, %d target rows\n", source.NumRows(), target.NumRows())
+			fmt.Println("Processing without key columns may be very slow. Consider specifying key columns.")
+		}
+	}
+
+	// Check for cancellation
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
 	// Build key arrays for source and target
+	fmt.Println("Building key arrays...")
 	sourceKey, err := d.buildKeyArray(source, keyColumns)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build source keys: %w", err)
@@ -282,29 +303,67 @@ func (d *ArrowDiffer) computeDiff(
 	}
 	defer targetKey.Release()
 
+	fmt.Println("Creating key maps...")
 	// Create maps to track record indices by key
-	sourceKeyMap := make(map[string]int64)
-	targetKeyMap := make(map[string]int64)
+	// Pre-allocate maps with capacity based on number of rows
+	sourceKeyMap := make(map[string]int64, source.NumRows())
+	targetKeyMap := make(map[string]int64, target.NumRows())
 
 	// Populate source key map
-	for i := int64(0); i < int64(sourceKey.Len()); i++ {
+	for i := int64(0); i < source.NumRows(); i++ {
+		// Check for cancellation periodically
+		if i > 0 && i%1000000 == 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
+			fmt.Printf("Processed %d/%d source keys...\n", i, source.NumRows())
+		}
+
 		key := d.arrayValueToString(sourceKey, int(i))
 		sourceKeyMap[key] = i
 	}
 
 	// Populate target key map
-	for i := int64(0); i < int64(targetKey.Len()); i++ {
+	for i := int64(0); i < target.NumRows(); i++ {
+		// Check for cancellation periodically
+		if i > 0 && i%1000000 == 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
+			fmt.Printf("Processed %d/%d target keys...\n", i, target.NumRows())
+		}
+
 		key := d.arrayValueToString(targetKey, int(i))
 		targetKeyMap[key] = i
 	}
 
+	fmt.Println("Finding added and deleted records...")
 	// Track indices for added/deleted/modified records
-	var addedIndices, deletedIndices []int64
-	var modifiedSourceIndices, modifiedTargetIndices []int64
-	modifiedColumns := make(map[string]int64)
+	// Pre-allocate slices with a capacity hint
+	estimatedChanges := int(float64(source.NumRows()+target.NumRows()) * 0.1) // Assume ~10% changes
+	if estimatedChanges < 1000 {
+		estimatedChanges = 1000
+	}
+
+	addedIndices := make([]int64, 0, estimatedChanges)
+	deletedIndices := make([]int64, 0, estimatedChanges)
+	modifiedColumns := make(map[string]int64, source.Schema().NumFields())
 
 	// Find added records (in target but not in source)
-	for i := int64(0); i < int64(targetKey.Len()); i++ {
+	for i := int64(0); i < target.NumRows(); i++ {
+		// Check for cancellation periodically
+		if i > 0 && i%1000000 == 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
+		}
+
 		key := d.arrayValueToString(targetKey, int(i))
 		if _, exists := sourceKeyMap[key]; !exists {
 			addedIndices = append(addedIndices, i)
@@ -312,22 +371,36 @@ func (d *ArrowDiffer) computeDiff(
 	}
 
 	// Find deleted records (in source but not in target)
-	for i := int64(0); i < int64(sourceKey.Len()); i++ {
+	for i := int64(0); i < source.NumRows(); i++ {
+		// Check for cancellation periodically
+		if i > 0 && i%1000000 == 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
+		}
+
 		key := d.arrayValueToString(sourceKey, int(i))
 		if _, exists := targetKeyMap[key]; !exists {
 			deletedIndices = append(deletedIndices, i)
 		}
 	}
 
+	fmt.Println("Comparing matching records...")
 	// Find and compute modified records
 	// For each key in both source and target, compare the records
 	var mutex sync.Mutex
 	var g errgroup.Group
-	semaphore := make(chan struct{}, options.NumWorkers)
-	if options.NumWorkers == 0 {
-		// Default to 4 workers if not specified
-		semaphore = make(chan struct{}, 4)
+
+	// Initialize semaphore for worker count
+	numWorkers := options.NumWorkers
+	if numWorkers <= 0 {
+		numWorkers = 4 // Default to 4 workers
 	}
+
+	// Create semaphore with the specified number of workers
+	semaphore := make(chan struct{}, numWorkers)
 
 	// Get the columns to compare (excluding key and ignored columns)
 	compareColumns := d.getCompareColumns(source, keyColumns, options.IgnoreColumns)
@@ -335,47 +408,106 @@ func (d *ArrowDiffer) computeDiff(
 	// Prepare structures to hold modifications
 	var modifications []modificationRecord
 
+	// Create source keys slice for parallel processing to avoid map access contention
+	sourceKeys := make([]string, 0, len(sourceKeyMap))
+	for key := range sourceKeyMap {
+		sourceKeys = append(sourceKeys, key)
+	}
+
 	// Compare records with matching keys
-	for i := int64(0); i < int64(sourceKey.Len()); i++ {
-		key := d.arrayValueToString(sourceKey, int(i))
-		if targetIdx, exists := targetKeyMap[key]; exists {
-			// Both records exist, need to compare field by field
-			sourceIdx := i
+	if options.Parallel && numWorkers > 1 {
+		fmt.Printf("Using parallel comparison with %d workers\n", numWorkers)
 
-			if options.Parallel {
-				semaphore <- struct{}{} // Acquire semaphore
-				g.Go(func() error {
-					defer func() { <-semaphore }() // Release semaphore when done
+		// Calculate chunk size for balanced distribution of work
+		chunkSize := (len(sourceKeys) + numWorkers - 1) / numWorkers
 
-					isDifferent, diffColumns, err := d.compareRecords(
-						source, target,
-						sourceIdx, targetIdx,
-						compareColumns,
-						options.Tolerance,
-					)
-					if err != nil {
-						return err
-					}
+		// Process in chunks to reduce goroutine overhead
+		for i := 0; i < len(sourceKeys); i += chunkSize {
+			// Capture loop variables
+			start := i
+			end := start + chunkSize
+			if end > len(sourceKeys) {
+				end = len(sourceKeys)
+			}
 
-					if isDifferent {
-						mutex.Lock()
-						defer mutex.Unlock()
+			// Submit this chunk to the worker pool
+			semaphore <- struct{}{} // Acquire semaphore
+			g.Go(func() error {
+				defer func() { <-semaphore }() // Release semaphore when done
 
-						modifications = append(modifications, modificationRecord{
-							sourceIdx: sourceIdx,
-							targetIdx: targetIdx,
-							columns:   diffColumns,
-						})
+				localMods := make([]modificationRecord, 0, end-start)
+				localColMods := make(map[string]int64)
 
-						// Update column modification counts
-						for col := range diffColumns {
-							modifiedColumns[col]++
+				// Process this chunk of keys
+				for j := start; j < end; j++ {
+					key := sourceKeys[j]
+					sourceIdx := sourceKeyMap[key]
+
+					if targetIdx, exists := targetKeyMap[key]; exists {
+						// Records exist in both source and target, compare them
+						isDifferent, diffColumns, err := d.compareRecords(
+							source, target,
+							sourceIdx, targetIdx,
+							compareColumns,
+							options.Tolerance,
+						)
+						if err != nil {
+							return err
+						}
+
+						if isDifferent {
+							// Found differences, record them
+							localMods = append(localMods, modificationRecord{
+								sourceIdx: sourceIdx,
+								targetIdx: targetIdx,
+								columns:   diffColumns,
+							})
+
+							// Update local column modification counts
+							for col := range diffColumns {
+								localColMods[col]++
+							}
 						}
 					}
-					return nil
-				})
-			} else {
-				// Serial comparison
+				}
+
+				// Merge results back to main arrays under lock
+				if len(localMods) > 0 {
+					mutex.Lock()
+					defer mutex.Unlock()
+
+					modifications = append(modifications, localMods...)
+
+					// Merge column counts
+					for col, count := range localColMods {
+						modifiedColumns[col] += count
+					}
+				}
+
+				return nil
+			})
+		}
+
+		// Wait for all comparison goroutines to complete
+		if err := g.Wait(); err != nil {
+			return nil, fmt.Errorf("error during parallel record comparison: %w", err)
+		}
+	} else {
+		// Serial comparison
+		fmt.Println("Using serial comparison")
+		for key, sourceIdx := range sourceKeyMap {
+			// Check for cancellation periodically
+			if sourceIdx > 0 && sourceIdx%100000 == 0 {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				default:
+				}
+				fmt.Printf("Compared %d/%d matching records...\n", sourceIdx, len(sourceKeyMap))
+			}
+
+			if targetIdx, exists := targetKeyMap[key]; exists {
+				// Both records exist, need to compare field by field
 				isDifferent, diffColumns, err := d.compareRecords(
 					source, target,
 					sourceIdx, targetIdx,
@@ -402,15 +534,14 @@ func (d *ArrowDiffer) computeDiff(
 		}
 	}
 
-	// Wait for all comparison goroutines to complete
-	if err := g.Wait(); err != nil {
-		return nil, fmt.Errorf("error during parallel record comparison: %w", err)
-	}
-
+	fmt.Println("Creating result records...")
 	// Extract the modified indices from the modifications slice
-	for _, mod := range modifications {
-		modifiedSourceIndices = append(modifiedSourceIndices, mod.sourceIdx)
-		modifiedTargetIndices = append(modifiedTargetIndices, mod.targetIdx)
+	modifiedSourceIndices := make([]int64, len(modifications))
+	modifiedTargetIndices := make([]int64, len(modifications))
+
+	for i, mod := range modifications {
+		modifiedSourceIndices[i] = mod.sourceIdx
+		modifiedTargetIndices[i] = mod.targetIdx
 	}
 
 	// Create result records by taking slices of the original records
@@ -446,8 +577,8 @@ func (d *ArrowDiffer) computeDiff(
 
 	// Create diff summary
 	summary := core.DiffSummary{
-		TotalSource: int64(source.NumRows()),
-		TotalTarget: int64(target.NumRows()),
+		TotalSource: source.NumRows(),
+		TotalTarget: target.NumRows(),
 		Added:       int64(len(addedIndices)),
 		Deleted:     int64(len(deletedIndices)),
 		Modified:    int64(len(modifiedSourceIndices)),
@@ -462,52 +593,71 @@ func (d *ArrowDiffer) computeDiff(
 	}, nil
 }
 
-// buildKeyArray creates a dict array from key columns for efficient comparison
+// buildKeyArray creates a string array from record keys for efficient comparisons.
 func (d *ArrowDiffer) buildKeyArray(record arrow.Record, keyColumns []string) (arrow.Array, error) {
-	// Special case: if there's just one key column, use it directly
+	// Early return if no key columns
+	if len(keyColumns) == 0 {
+		return nil, fmt.Errorf("no key columns specified")
+	}
+
+	// For a single key column that's already a string type, just extract it
 	if len(keyColumns) == 1 {
-		idx := d.findColumnIndex(record, keyColumns[0])
-		if idx < 0 {
-			return nil, fmt.Errorf("key column %s not found", keyColumns[0])
+		colIdx := d.findColumnIndex(record, keyColumns[0])
+		if colIdx == -1 {
+			return nil, fmt.Errorf("key column not found: %s", keyColumns[0])
 		}
 
-		// Clone the column to avoid ownership issues
-		col := record.Column(idx)
-		// Create a new array from the existing one
-		arr := array.MakeFromData(col.Data())
-		return arr, nil
-	}
+		col := record.Column(colIdx)
 
-	// For multiple key columns, concatenate them into a dictionary array
-	var keyValues []string
-	for i := int64(0); i < record.NumRows(); i++ {
-		var sb strings.Builder
-		for j, colName := range keyColumns {
-			colIdx := d.findColumnIndex(record, colName)
-			if colIdx < 0 {
-				return nil, fmt.Errorf("key column %s not found", colName)
-			}
-
-			col := record.Column(colIdx)
-			if col.IsNull(int(i)) {
-				sb.WriteString("NULL")
-			} else {
-				sb.WriteString(d.arrayValueToString(col, int(i)))
-			}
-
-			if j < len(keyColumns)-1 {
-				sb.WriteString(":")
-			}
+		// If it's already a string column, return a reference
+		if col.DataType().ID() == arrow.STRING {
+			col.Retain() // Must retain since we're returning a reference
+			return col, nil
 		}
-		keyValues = append(keyValues, sb.String())
 	}
 
-	// Create a string array from the concatenated keys
+	// For multiple key columns or non-string columns, we need to concatenate them
 	builder := array.NewStringBuilder(d.alloc)
 	defer builder.Release()
 
-	for _, val := range keyValues {
-		builder.Append(val)
+	// Process record batch in chunks of ~1M rows at a time to reduce memory pressure
+	const chunkSize = 1000000
+	numRows := int(record.NumRows())
+
+	// Pre-allocate memory for the expected number of strings
+	builder.Reserve(min(numRows, chunkSize))
+
+	// Process in chunks
+	for startRow := 0; startRow < numRows; startRow += chunkSize {
+		endRow := min(startRow+chunkSize, numRows)
+
+		// Build keys for this chunk
+		for i := startRow; i < endRow; i++ {
+			// For each row, concatenate the key column values
+			var keyBuilder strings.Builder
+
+			for j, keyCol := range keyColumns {
+				colIdx := d.findColumnIndex(record, keyCol)
+				if colIdx == -1 {
+					return nil, fmt.Errorf("key column not found: %s", keyCol)
+				}
+
+				// Add a separator between key parts
+				if j > 0 {
+					keyBuilder.WriteByte('|')
+				}
+
+				col := record.Column(colIdx)
+				if col.IsNull(i) {
+					keyBuilder.WriteString("NULL")
+				} else {
+					// Convert value to string representation
+					keyBuilder.WriteString(d.arrayValueToString(col, i))
+				}
+			}
+
+			builder.Append(keyBuilder.String())
+		}
 	}
 
 	return builder.NewArray(), nil
@@ -649,9 +799,22 @@ func (d *ArrowDiffer) floatEqual(a, b, tolerance float64) bool {
 
 // takeIndices creates a new record by selecting specific indices from an existing record
 func (d *ArrowDiffer) takeIndices(record arrow.Record, indices []int64) arrow.Record {
+	// If no indices to take, return empty record with the schema
+	if len(indices) == 0 {
+		return array.NewRecord(record.Schema(), []arrow.Array{}, 0)
+	}
+
+	// For large result sets, print progress
+	if len(indices) > 100000 {
+		fmt.Printf("Extracting %d records from dataset of %d rows\n", len(indices), record.NumRows())
+	}
+
 	// Convert Go slice to Arrow array for indices
 	indicesBuilder := array.NewInt64Builder(d.alloc)
 	defer indicesBuilder.Release()
+
+	// Pre-allocate capacity for better performance
+	indicesBuilder.Reserve(len(indices))
 
 	for _, idx := range indices {
 		indicesBuilder.Append(idx)
@@ -660,41 +823,140 @@ func (d *ArrowDiffer) takeIndices(record arrow.Record, indices []int64) arrow.Re
 	indicesArr := indicesBuilder.NewArray()
 	defer indicesArr.Release()
 
-	// Take the indices from each column by directly slicing
-	cols := make([]arrow.Array, record.NumCols())
-	for i := 0; i < int(record.NumCols()); i++ {
-		col := record.Column(i)
+	// Process in batches for large result sets to reduce memory pressure
+	const batchSize = 100000
+	numIndices := len(indices)
+	numBatches := (numIndices + batchSize - 1) / batchSize
 
-		// Create a builder for this column type
-		builder := array.NewBuilder(d.alloc, col.DataType())
-		defer builder.Release()
+	if numBatches > 1 {
+		// For multiple batches, we'll process one batch at a time
+		resultBatches := make([]arrow.Record, 0, numBatches)
 
-		// Append only the selected indices
-		for _, idx := range indices {
-			if int(idx) < col.Len() {
-				if col.IsNull(int(idx)) {
-					builder.AppendNull()
-				} else {
-					// This is a simplification - a full implementation would need
-					// type-specific appending for each Arrow type
-					val := col.GetOneForMarshal(int(idx))
-					builder.AppendValueFromString(fmt.Sprintf("%v", val))
-				}
+		for batchIdx := 0; batchIdx < numBatches; batchIdx++ {
+			startIdx := batchIdx * batchSize
+			endIdx := (batchIdx + 1) * batchSize
+			if endIdx > numIndices {
+				endIdx = numIndices
 			}
+
+			// Extract this batch of indices
+			batchIndices := indices[startIdx:endIdx]
+
+			// Take the indices from each column
+			cols := make([]arrow.Array, record.NumCols())
+
+			for i := 0; i < int(record.NumCols()); i++ {
+				col := record.Column(i)
+
+				// Create a builder for this column type
+				builder := array.NewBuilder(d.alloc, col.DataType())
+				defer builder.Release()
+
+				// Pre-allocate for better performance
+				if cap := builder.Cap(); cap < len(batchIndices) {
+					builder.Reserve(len(batchIndices))
+				}
+
+				// Append only the selected indices
+				for _, idx := range batchIndices {
+					if int(idx) < col.Len() {
+						if col.IsNull(int(idx)) {
+							builder.AppendNull()
+						} else {
+							// This is a simplification - a full implementation would need
+							// type-specific appending for each Arrow type
+							val := col.GetOneForMarshal(int(idx))
+							builder.AppendValueFromString(fmt.Sprintf("%v", val))
+						}
+					}
+				}
+
+				cols[i] = builder.NewArray()
+			}
+
+			// Create batch record
+			batchRecord := array.NewRecord(record.Schema(), cols, int64(len(batchIndices)))
+
+			// Release the column arrays after they're added to the record
+			for _, col := range cols {
+				col.Release()
+			}
+
+			resultBatches = append(resultBatches, batchRecord)
 		}
 
-		cols[i] = builder.NewArray()
+		// Combine all batches into a single result
+		if len(resultBatches) == 1 {
+			// Just one batch, return it
+			return resultBatches[0]
+		}
+
+		// Create a table from all batches
+		resultTable := array.NewTableFromRecords(record.Schema(), resultBatches)
+		defer resultTable.Release()
+
+		// Release the individual batch records
+		for _, batch := range resultBatches {
+			batch.Release()
+		}
+
+		// Convert table to record batch
+		tableReader := array.NewTableReader(resultTable, resultTable.NumRows())
+		defer tableReader.Release()
+
+		if !tableReader.Next() {
+			// Shouldn't happen, but let's be safe
+			return array.NewRecord(record.Schema(), []arrow.Array{}, 0)
+		}
+
+		// Create a consolidated record
+		result := tableReader.Record()
+		// Clone the record to ensure we own it
+		clonedResult := array.NewRecord(record.Schema(), result.Columns(), result.NumRows())
+		return clonedResult
+	} else {
+		// Single batch processing
+		// Take the indices from each column
+		cols := make([]arrow.Array, record.NumCols())
+		for i := 0; i < int(record.NumCols()); i++ {
+			col := record.Column(i)
+
+			// Create a builder for this column type
+			builder := array.NewBuilder(d.alloc, col.DataType())
+			defer builder.Release()
+
+			// Pre-allocate for better performance
+			if cap := builder.Cap(); cap < len(indices) {
+				builder.Reserve(len(indices))
+			}
+
+			// Append only the selected indices
+			for _, idx := range indices {
+				if int(idx) < col.Len() {
+					if col.IsNull(int(idx)) {
+						builder.AppendNull()
+					} else {
+						// This is a simplification - a full implementation would need
+						// type-specific appending for each Arrow type
+						val := col.GetOneForMarshal(int(idx))
+						builder.AppendValueFromString(fmt.Sprintf("%v", val))
+					}
+				}
+			}
+
+			cols[i] = builder.NewArray()
+		}
+
+		// Create new record with the selected indices
+		result := array.NewRecord(record.Schema(), cols, int64(len(indices)))
+
+		// Release the column arrays after they're added to the record
+		for _, col := range cols {
+			col.Release()
+		}
+
+		return result
 	}
-
-	// Create new record with the selected indices
-	result := array.NewRecord(record.Schema(), cols, int64(len(indices)))
-
-	// Release the column arrays after they're added to the record
-	for _, col := range cols {
-		col.Release()
-	}
-
-	return result
 }
 
 // createModifiedRecord creates a record for rows that were modified
@@ -850,4 +1112,12 @@ func containsString(slice []string, item string) bool {
 		}
 	}
 	return false
+}
+
+// min returns the smaller of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

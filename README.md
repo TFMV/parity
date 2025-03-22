@@ -11,7 +11,7 @@ Parity is a high-performance dataset comparison tool designed to efficiently det
 - **Arrow-Powered Analysis**: Leverage Arrow's in-memory columnar format for high-performance operations
 - **Flexible Memory Management**: Process data in streaming batches or load complete datasets based on your needs
 - **Parallel Execution**: Utilize Go's concurrency model for processing partitions simultaneously
-- **Flexible Output**: Export results in various formats including Arrow IPC, Parquet, JSON, Markdown, and HTML
+- **Flexible Output**: Export results in various formats including Arrow IPC, Parquet, and JSON
 
 ## Installation
 
@@ -95,7 +95,7 @@ parity diff --full-load source.parquet target.parquet
 
 ## Diff Strategies
 
-Parity provides different diff strategies to suit your needs:
+Parity provides a modular diff system.
 
 ### ArrowDiffer (Default)
 
